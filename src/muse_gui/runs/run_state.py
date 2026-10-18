@@ -119,7 +119,7 @@ class RunState:
                          "frame": None, "available": False, "reason": reason}
         self.selection_frame = None
 
-    def accepts_frame(self, frame: dict | None) -> bool:
+    def accepts_frame(self, frame: dict | None, *, for_selection: bool = False) -> bool:
         if self.display_pending or frame is None or self.display is None or frame["run_id"] != self.run_id:
             return False
         display = self.display
@@ -130,13 +130,20 @@ class RunState:
             return False
         if self._scene_hash is not None and frame["scene_hash"] != self._scene_hash:
             return False
-        for previous in (self._latest_frame, display["frame"], self.selection_frame):
-            if (previous is not None and previous["selection_seq"] == frame["selection_seq"]
-                    and previous["world_id"] == frame["world_id"]):
-                if previous["scene_hash"] != frame["scene_hash"] or (
-                        frame["episode"], frame["decision"], frame["tick"]) < (
-                        previous["episode"], previous["decision"], previous["tick"]):
-                    return False
+        matching = [previous for previous in (self._latest_frame, display["frame"], self.selection_frame)
+                    if previous is not None and previous["selection_seq"] == frame["selection_seq"]
+                    and previous["world_id"] == frame["world_id"]]
+        # viewer 与实体传输可不同步；拾取只需同一已知 episode，不跟随实体的 tick 水位。
+        if for_selection and (not matching or frame["episode"] != max(previous["episode"] for previous in matching)):
+            return False
+        for previous in matching:
+            if previous["scene_hash"] != frame["scene_hash"]:
+                return False
+            if for_selection and previous is not self.selection_frame:
+                continue
+            if (frame["episode"], frame["decision"], frame["tick"]) < (
+                    previous["episode"], previous["decision"], previous["tick"]):
+                return False
         return True
 
     def apply_entities(self, snapshot: dict) -> None:
@@ -158,7 +165,7 @@ class RunState:
             return
         if event["kind"] == "pairing":
             self.pairing = deepcopy(event)
-        elif event["kind"] == "selection" and self.accepts_frame(event.get("frame")):
+        elif event["kind"] == "selection" and self.accepts_frame(event.get("frame"), for_selection=True):
             self.selected_object = event.get("object_id")
             self.selection_frame = deepcopy(event["frame"])
         elif event["kind"] == "error":

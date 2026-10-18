@@ -307,9 +307,34 @@ def test_private_selection_rejects_old_world_and_episode(running):
     connection.push("/view?", {"kind": "selection", "view_id": "private", "object_id": "scout_0", "frame": frame()})
     assert controller.state.selected_object == "scout_0"
     current = deepcopy(controller.state.selection_frame)
-    for old in [frame(world=0), frame(episode=1, decision=99)]:
+    for old in [frame(world=0), frame(episode=1, decision=99), frame(seq=2), frame(episode=3),
+                {**frame(), "run_id": "other"}, {**frame(), "scene_hash": "b" * 64}]:
         connection.push("/view?", {"kind": "selection", "view_id": "private", "object_id": None, "frame": old})
         assert controller.state.selected_object == "scout_0" and controller.state.selection_frame == current
+
+
+def test_selection_can_lag_entity_frame_without_mixing_headers_or_weakening_pose_order(running):
+    connection, _, controller, view = running
+    connection.answer("/runs/r/display/clients", {"view_id": "private", "connected": False}, method="POST")
+    connection.push("/entities", entities(frame(decision=11)))
+    controller.refresh()
+    connection.answer("/runs/r/display", {**display(), "frame": frame(decision=11)})
+    connection.push("/view?", {"kind": "selection", "view_id": "private", "object_id": "scout_0",
+                                "frame": frame(decision=10)})
+    assert controller.state.selected_object == "scout_0"
+    assert controller.state.selection_frame["decision"] == 10
+    assert controller.state.entities["frame"]["decision"] == 11
+    details = json.loads(view.object_details.toPlainText())
+    assert details["selection_frame"]["decision"] == 10 and details["entity_frame"]["decision"] == 11
+    # 拾取消息自身仍单调；实体的旧 pose 也不能因允许拾取传输延迟而回退。
+    connection.push("/view?", {"kind": "selection", "view_id": "private", "object_id": None,
+                                "frame": frame(decision=9)})
+    assert controller.state.selected_object == "scout_0" and controller.state.selection_frame["decision"] == 10
+    stale = entities(frame(decision=10))
+    stale["objects"][0]["pose"]["position"] = [99., 99., 99.]
+    connection.push("/entities", stale)
+    assert controller.state.entities["frame"]["decision"] == 11
+    assert controller.state.entities["objects"][0]["pose"]["position"] == [1., 2., 3.]
 
 
 def test_unavailable_objects_never_expose_historical_pose_as_current(running):
