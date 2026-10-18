@@ -1,0 +1,8 @@
+PySide6==6.12.0
+PySide6-Fluent-Widgets==1.11.3
+pyqtgraph==0.14.0
+numpy==2.5.4
+scipy==1.18.1
+httpx2==2.13.1
+websockets==17.2
+pytest==9.1.1
