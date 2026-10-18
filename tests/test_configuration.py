@@ -4,10 +4,12 @@ import json
 import pytest
 from PySide6.QtCore import QEvent, QObject, Signal, Qt
 from PySide6.QtTest import QTest
+from qfluentwidgets import LineEdit
 
 from muse_gui.experiments.configuration_controller import ConfigurationController
 from muse_gui.experiments.experiment_draft import ExperimentDraft
 from muse_gui.experiments.research_config_view import ResearchConfigView
+from muse_gui.experiments.schema_editor import at
 
 
 @pytest.fixture(autouse=True)
@@ -138,6 +140,8 @@ def test_disabled_selection_keeps_valid_config(configured):
 
 def test_inspection_captures_revision_and_drops_late_or_old_generation(configured):
     draft, connection, view, controller = configured
+    reports = []
+    controller.report_received.connect(reports.append)
     controller.inspect()
     identity, method, path, kwargs = connection.sent[-1]
     assert (method, path) == ("POST", "/experiments/inspect")
@@ -155,6 +159,9 @@ def test_inspection_captures_revision_and_drops_late_or_old_generation(configure
     identity = connection.sent[-1][0]
     connection.result_received.emit(2, identity, {"ok": True, "data": report})
     assert draft.validated_revision == draft.revision
+    assert view.report == report
+    assert reports == [report]
+    assert "inspection" in view.status_label.text()
 
 
 def test_pending_is_saved_before_inspect_and_blocks_stale_numeric_request(configured):
@@ -462,6 +469,115 @@ def test_run_options_ownership_and_sensor_choices(configured):
     sensors = view.fixed_editor.fields[("request", "scenario", "entity_groups", 0, "sensor_profile_id")].editor
     assert sensors.findData("imu") >= 0
     assert sensors.findData("wrong") == -1
+
+
+@pytest.mark.parametrize("path", [
+    ("task_config",), ("algorithm_config",), ("cost_config",),
+    ("model_config", "radio"),
+    ("term_config", "roles", "alpha", "observation", "same", "config"),
+    ("scenario", "entity_groups", 0, "sensor_config"),
+])
+def test_private_schema_reference_names_remain_freely_editable(configured, path):
+    draft, _, view, _ = configured
+    values = {"tx": "custom-tx", "rx": "custom-rx", "group_id": "uav", "device_id": "custom-device",
+              "endpoints": ["custom-endpoint"], "resource_ids": ["custom-resource"], "nested": {"tx": "nested-tx"}}
+    schema = {"type": "object", "properties": {
+        **{key: {"type": "string"} for key in ("tx", "rx", "group_id", "device_id")},
+        **{key: {"type": "array", "items": {"type": "string"}} for key in ("endpoints", "resource_ids")},
+        "nested": {"type": "object", "properties": {"tx": {"type": "string"}}},
+    }}
+    draft.set_value(("request", *path), values)
+    view.show_report({"sections": [{"path": list(path), "schema": schema, "effective": values,
+                                   "origins": {}, "missing": [], "errors": []}],
+                      "errors": [], "resolved_experiment": None})
+    editor = next(editor for editor in view._editors if tuple(editor.section["path"]) == ("request", *path))
+    for suffix in (("tx",), ("rx",), ("group_id",), ("device_id",), ("endpoints", 0), ("resource_ids", 0), ("nested", "tx")):
+        field = editor.fields[("request", *path, *suffix)]
+        assert isinstance(field.editor, LineEdit)
+        field.editor.setText("arbitrary-new-value")
+        view.flush()
+        assert at(draft.document, ("request", *path, *suffix)) == "arbitrary-new-value"
+
+
+@pytest.mark.parametrize("scenario", [
+    None, 7, {}, {"entity_groups": 7}, {"entity_groups": [None, 7, {}]},
+    {"network": 7}, {"network": {"resources": [None, 7]}},
+    {"radio_geometry": 7}, {"radio_geometry": {"endpoints": 7}},
+    {"radio_geometry": {"links": [None, 7]}},
+])
+def test_raw_incomplete_scenario_is_displayed_without_rewriting(qapp, scenario):
+    draft = ExperimentDraft()
+    draft.set_value(("request", "scenario"), scenario)
+    document = draft.document
+    view = ResearchConfigView()
+    try:
+        view.set_catalog(**catalog(), catalog_id="catalog-a")
+        view.set_document(document)
+        view.flush()
+        assert draft.document == document
+        assert view.fixed_editor.fields[("request", "scenario")]
+    finally:
+        view.close()
+        view.deleteLater()
+
+
+def test_sdk_reference_paths_keep_choices_and_unmatched_values(configured):
+    draft, _, view, controller = configured
+    records = catalog()
+    records["entity_models"][0]["metadata"]["radio_devices"] = {"antenna": {}}
+    string = {"type": "string"}
+    strings = {"type": "array", "items": string}
+    endpoint = {"type": "object", "properties": {"group_id": string, "device_id": string}}
+    link = {"type": "object", "properties": {"link_id": string, "tx": string, "rx": string}}
+    sensing = {"type": "object", "properties": {"tx": string, "rx": string,
+               "target": {"type": "object", "properties": {"group_id": string}}}}
+    allocation = {"type": "object", "properties": {"link_id": string, "resource_ids": strings}}
+    properties = records["schema"]["experiment_request"]["properties"]["scenario"]["properties"]
+    properties["radio_geometry"] = {"type": "object", "properties": {
+        "endpoints": {"type": "object", "additionalProperties": endpoint},
+        "links": {"type": "array", "items": link}, "sensing": {"type": "array", "items": sensing}}}
+    properties["network"] = {"type": "object", "properties": {
+        "resources": {"type": "array", "items": {"type": "object", "properties": {"resource_id": string}}},
+        "endpoint_limits": {"type": "object", "additionalProperties": {"type": "object", "properties": {"resource_ids": strings}}},
+        "background_emitters": {"type": "array", "items": {"type": "object", "properties": {"endpoints": strings}}},
+        "passive_endpoints": strings,
+        **{kind: {"type": "array", "items": allocation} for kind in ("communication_allocations", "services")}}}
+    request = draft.document["request"]
+    request["scenario"]["radio_geometry"] = {
+        "endpoints": {"e0": {"group_id": "uav", "device_id": "missing"}},
+        "links": [{"link_id": "l0", "tx": "missing", "rx": "missing"}],
+        "sensing": [{"tx": "missing", "rx": "missing", "target": {"group_id": "missing"}}]}
+    request["scenario"]["network"] = {
+        "resources": [{"resource_id": "r0"}], "endpoint_limits": {"e0": {"resource_ids": ["missing"]}},
+        "background_emitters": [{"endpoints": ["missing"]}], "passive_endpoints": ["missing"],
+        "communication_allocations": [{"link_id": "missing", "resource_ids": ["missing"]}],
+        "services": [{"link_id": "missing", "resource_ids": ["missing"]}]}
+    request["role_config"] = {"alpha": {"group_id": "missing"}}
+    draft.set_value(("request",), request)
+    controller.set_catalog(**records)
+    role_schema = {"type": "object", "additionalProperties": {"type": "object", "properties": {"group_id": string}}}
+    view.show_report({"sections": [{"path": ["role_config"], "schema": role_schema,
+                                   "effective": request["role_config"], "origins": {}, "missing": [], "errors": []}],
+                      "errors": [], "resolved_experiment": None})
+    geometry = ("request", "scenario", "radio_geometry")
+    network = ("request", "scenario", "network")
+    cases = [((*geometry, "endpoints", "e0", "device_id"), "antenna"),
+             *(((*geometry, kind, 0, field), "e0") for kind in ("links", "sensing") for field in ("tx", "rx")),
+             ((*geometry, "sensing", 0, "target", "group_id"), "uav"),
+             ((*network, "endpoint_limits", "e0", "resource_ids", 0), "r0"),
+             ((*network, "background_emitters", 0, "endpoints", 0), "e0"),
+             ((*network, "passive_endpoints", 0), "e0"),
+             ((*network, "communication_allocations", 0, "link_id"), "l0"),
+             ((*network, "communication_allocations", 0, "resource_ids", 0), "r0"),
+             ((*network, "services", 0, "link_id"), "l0"),
+             ((*network, "services", 0, "resource_ids", 0), "r0"),
+             (("request", "role_config", "alpha", "group_id"), "uav")]
+    for path, selected in cases:
+        field = next(editor.fields[path] for editor in view._editors if path in editor.fields)
+        assert field.editor.currentData() == "missing"
+        assert "未匹配" in field.editor.currentText()
+        field.editor.setCurrentIndex(field.editor.findData(selected))
+        assert at(draft.document, path) == selected
 
 
 def test_pending_run_option_error_locates_its_actual_control(configured):

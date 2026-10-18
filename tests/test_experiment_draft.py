@@ -95,7 +95,7 @@ def test_save_and_inspect_ignore_later_edits(qapp, tmp_path, wait_until, monkeyp
     try:
         wait_until(entered.is_set)
         draft.set_value(("name",), "later")
-        draft.mark_validated(n, {"ok": True})
+        draft.mark_validated(n)
     finally:
         release.set()
     wait_until(lambda: not draft.saving)
@@ -164,9 +164,8 @@ def test_validation_is_separate_from_save_and_undo(qapp, tmp_path):
     draft = ExperimentDraft()
     draft.set_value(("request", "seed"), 3)
     n = draft.revision
-    draft.mark_validated(n, {"errors": ["incomplete"]})
+    draft.mark_validated(n)
     assert draft.validated_revision == n
-    assert draft.validation_report == {"errors": ["incomplete"]}
     assert draft.dirty
     draft.save(tmp_path / "draft.muse.json")
     assert draft.validated_revision == n

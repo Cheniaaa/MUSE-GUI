@@ -45,6 +45,7 @@ class WorkbenchController(QObject):
         self.settings.status_requested.connect(lambda profile: self._local('status', profile))
         self.settings.stop_requested.connect(self.stop_backend)
         connection.state_changed.connect(self._connection_changed)
+        connection.result_received.connect(self._cache_result)
         self.launcher.state_changed.connect(self.settings.set_backend_state)
         self.resources.example_ready.connect(self.accept_example)
         self.resources.resource_selected.connect(self.select_resource)
@@ -70,6 +71,8 @@ class WorkbenchController(QObject):
         row.addStretch()
         window.workbench.layout().insertLayout(1, row)
         window.prepare_resources_close = self.prepare_close
+        if connection.state['state'] != 'connected':
+            configuration.restore_cached_catalog(draft.document['catalog_id'] or self.settings.profile().get('catalog_id'))
 
     def mount_views(self):
         """正式入口装入场景与Run消费者；离线时不创建WebEngine页面或后端会话。"""
@@ -221,6 +224,10 @@ class WorkbenchController(QObject):
             if (self._view_context is not None and self._view_context[0] == 'run'
                     and self._run_catalog_id == state['catalog_id']):
                 self.run.open(self._view_context[1], new_run=False)
+
+    def _cache_result(self, generation, token, result):
+        if 'cache_error' in result:
+            self.window.workbench.show_message('在线数据已读取；本机缓存写入失败：' + str(result['cache_error']))
 
     def _replace_source(self, request, run_options, name):
         self.draft.replace_document(dict(format_version=1, draft_id=str(uuid4()), name=name,

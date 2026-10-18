@@ -111,7 +111,6 @@ class ExperimentDraft(QObject):
         self.undo_stack = QUndoStack(self)
         self.revision = 0
         self.validated_revision = None
-        self.validation_report = None
         self.source_path = None
         self._generation = 0
         self._save_thread = None
@@ -150,7 +149,6 @@ class ExperimentDraft(QObject):
         self._document = deepcopy(document)
         self.revision += 1
         self.validated_revision = None
-        self.validation_report = None
         self.changed.emit(self.revision)
         self.state_changed.emit()
 
@@ -211,10 +209,9 @@ class ExperimentDraft(QObject):
         _clear_input(document, cleanup)
         self._edit(document, path, "提交输入 " + pending_path, cleanup)
 
-    def mark_validated(self, revision: int, report: dict) -> None:
+    def mark_validated(self, revision: int) -> None:
         if revision == self.revision:
             self.validated_revision = revision
-            self.validation_report = deepcopy(report)
             self.state_changed.emit()
 
     @staticmethod

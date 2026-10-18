@@ -17,8 +17,6 @@ class ResourcesView(QWidget):
     example_ready = Signal(dict)
     resource_registered = Signal(dict)
     resource_selected = Signal(dict)
-    source_checked = Signal(dict)
-    editing_ready = Signal(dict)
 
     PATHS = {"training_package": "/catalog/training-packages", "environment": "/catalog/environments", "example": "/catalog/examples"}
 
@@ -33,7 +31,8 @@ class ResourcesView(QWidget):
         self._items = {key: [] for key in self.PATHS}
         self._next = {key: None for key in self.PATHS}
         self._page_epoch = 0
-        self._catalog_id = connection.state['catalog_id']
+        self._catalog_id = connection.state['catalog_id'] or settings.value('backend/profile', {}).get('catalog_id')
+        self._connected_generation = connection.state['generation'] if connection.state['state'] == 'connected' else None
         self._closing = False
         layout = QVBoxLayout(self)
         row = QHBoxLayout()
@@ -76,15 +75,20 @@ class ResourcesView(QWidget):
         self.status = BodyLabel("登记仅由明确点击触发；模板导入后由主窗口确认换稿。", self)
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
-        self.kind_selector.currentIndexChanged.connect(self._render)
+        self.cache_status = BodyLabel("", self)
+        self.cache_status.setWordWrap(True)
+        layout.addWidget(self.cache_status)
+        self.kind_selector.currentIndexChanged.connect(self._kind_changed)
         connection.result_received.connect(self._received)
         connection.state_changed.connect(self._connection_changed)
         self._retire_timer = QTimer(self)
         self._retire_timer.setInterval(50)
         self._retire_timer.timeout.connect(self._retire)
+        if connection.state['state'] != 'connected':
+            self.refresh()
 
     def _source_key(self, kind, resource_id, revision):
-        catalog = self.connection.state["catalog_id"]
+        catalog = self._catalog_id
         return f"catalog/{catalog}/sources/{kind}/{resource_id}/{revision}"
 
     def remember_source(self, record: dict, source: Path) -> None:
@@ -121,7 +125,37 @@ class ResourcesView(QWidget):
             self._catalog_page(kind, self._next[kind])
 
     def _catalog_page(self, kind, offset):
-        self._request("page", (kind, self._page_epoch), "GET", self.PATHS[kind], params={"offset": offset, "limit": 50})
+        params = {"offset": offset, "limit": 50}
+        if self.connection.state['state'] == 'connected':
+            self._request("page", (kind, self._page_epoch), "GET", self.PATHS[kind], params=params)
+            return
+        count, next_offset = len(self._items[kind]), self._next[kind]
+        try:
+            cached = self.connection.cached(self.PATHS[kind], params=params, catalog_id=self._catalog_id)
+            if cached is None:
+                self.cache_status.setText(f"离线；Catalog {self._catalog_id} 的 offset {offset} 尚无缓存，请连接后刷新。")
+                return
+            self._accept_page(kind, cached['data'])
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+            del self._items[kind][count:]
+            self._next[kind] = next_offset
+            self._render()
+            self.cache_status.setText(f"离线缓存读取失败：{error}")
+            return
+        self.cache_status.setText(f"离线缓存 · Catalog {cached['catalog_id']} / API {cached['api_revision']}"
+            f" · 来源 {cached['source']} · 本页保存于 {cached['saved_at']}；仅供浏览。")
+
+    def _accept_page(self, kind, page):
+        self._items[kind].extend(page['items'])
+        self._next[kind] = page['next_offset']
+        self._render()
+
+    def _kind_changed(self):
+        if self.connection.state['state'] == 'connected':
+            self.cache_status.setText('在线目录；刷新从后端读取当前分类。')
+            self._render()
+        else:
+            self.refresh()
 
     def new_from_example(self, example_id: str) -> None:
         self._request("example", example_id, "POST", f"/catalog/examples/{example_id}/import")
@@ -150,9 +184,7 @@ class ResourcesView(QWidget):
     def check_source(self, record: dict) -> None:
         association = self.source_for(record["kind"], record["resource_id"], record["revision"])
         if association is None or not Path(association["path"]).exists():
-            result = {"state": "missing", "reference": deepcopy(record), "message": "来源未关联或已缺失；仍可显式使用已登记版本。"}
-            self.status.setText(result["message"])
-            self.source_checked.emit(result)
+            self.status.setText("来源未关联或已缺失；仍可显式使用已登记版本。")
             return
         self._start_archive("check", record["kind"], Path(association["path"]), record["resource_id"], record)
 
@@ -176,13 +208,10 @@ class ResourcesView(QWidget):
             self._finish_operation(token)
         elif worker.error is not None:
             self.status.setText(str(worker.error))
-            self.source_checked.emit({"state": "error", "error": worker.error})
             self._finish_operation(token)
         elif operation["mode"] == "check":
-            result = {**worker.result, "state": "unchanged" if worker.result["sha256"] == operation["reference"]["sha256"] else "changed",
-                      "reference": deepcopy(operation["reference"]), "source": str(operation["source"])}
-            self.status.setText(f"{result['state']} / 当前 {result['sha256']}；变化时请选择更新、使用登记版本或返回编辑。")
-            self.source_checked.emit(result)
+            state = "unchanged" if worker.result["sha256"] == operation["reference"]["sha256"] else "changed"
+            self.status.setText(f"{state} / 当前 {worker.result['sha256']}；变化时请选择更新、使用登记版本或返回编辑。")
             self._finish_operation(token)
         else:
             operation["archive"] = worker.result
@@ -225,18 +254,18 @@ class ResourcesView(QWidget):
         if action == "page":
             kind, epoch = key
             if epoch == self._page_epoch:
-                self._items[kind].extend(result["data"]["items"])
-                self._next[kind] = result["data"]["next_offset"]
-                self._render()
+                self._accept_page(kind, result['data'])
+                self.cache_status.setText('在线目录 · Catalog ' + str(self._catalog_id)
+                    + ('；缓存写入失败：' + str(result['cache_error']) if 'cache_error' in result else ''))
         elif action == "example":
             self.status.setText("模板资源已登记；等待主窗口确认替换草稿。研究效果标签：" + json.dumps(result["data"]["research_status"], ensure_ascii=False))
             self.example_ready.emit(deepcopy(result["data"]))
         else:
             self.details.setPlainText(json.dumps(result["data"], ensure_ascii=False, indent=2))
-            self.editing_ready.emit(deepcopy(result["data"]))
 
     def _connection_changed(self, state):
-        if state["state"] == "connected" and state['catalog_id'] != self._catalog_id:
+        if state["state"] == "connected" and state['generation'] != self._connected_generation:
+            self._connected_generation = state['generation']
             self._catalog_id = state['catalog_id']
             self._page_epoch += 1
             self._items = {key: [] for key in self.PATHS}
@@ -244,12 +273,15 @@ class ResourcesView(QWidget):
             self.table.clearSelection()
             self.details.clear()
             self._render()
+            self.cache_status.setText('已连接；等待当前代际的真实目录。')
         elif state["state"] != "connected":
             # G1 可先发同代连接失败，再给原请求发送精确错误；不提前吞掉该结果。
             self._requests = {token: data for token, data in self._requests.items() if data[0] == state["generation"]}
             for operation in self._operations.values():
                 operation["cancelled"] = True
             self.status.setText("连接已失效；显示为旧目录，请重连后刷新。")
+            if not self._closing:
+                self.refresh()
             self._retire_timer.start()
 
     def _retire(self):

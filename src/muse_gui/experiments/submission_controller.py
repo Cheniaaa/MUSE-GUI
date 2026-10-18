@@ -61,14 +61,13 @@ class SubmissionController(QObject):
         self._set_stage("source_check")
         if self._stop_if_cancelled():
             return
+        if source_choice == "registered":
+            self._derive()
+            return
         request = document["request"]
         association = self.resources.source_for("training_package", request.get("training_package_id"), request.get("training_package_revision"))
         if association is None or not Path(association["path"]).exists():
-            if source_choice == "registered":
-                self._set_stage("source_missing_using_registered")
-                self._derive()
-            else:
-                self._fail("source_choice_required", {"kind": "source", "message": "源码未关联或已缺失；可显式使用已登记版本，或关联来源后更新。"})
+            self._fail("source_choice_required", {"kind": "source", "message": "源码未关联或已缺失；可显式使用已登记版本，或关联来源后更新。"})
             return
         pending = self._pending
         pending["source"] = Path(association["path"])
@@ -94,17 +93,17 @@ class SubmissionController(QObject):
         pending["archive"] = worker.result
         changed = worker.result["sha256"] != pending["reference"]["sha256"]
         choice = pending["source_choice"]
-        if changed and choice not in ("update", "registered"):
+        if changed and choice != "update":
             self._fail("source_choice_required", {"kind": "source_changed", "message": "来源已变化：请选择更新后运行、使用已登记版本或返回编辑。",
                                                  "registered_sha256": pending["reference"]["sha256"], "current_sha256": worker.result["sha256"]})
-        elif changed and choice == "update":
+        elif changed:
             self._set_stage("updating_resource")
             if self._stop_if_cancelled():
                 return
             token = self._begin_request("upload")
             self.connection.upload(token, "/catalog/training-packages", Path(worker.result["archive_path"]), pending["reference"]["resource_id"])
         else:
-            self._set_stage("source_changed_using_registered" if changed else "source_unchanged")
+            self._set_stage("source_unchanged")
             self._derive()
 
     def _derive(self):

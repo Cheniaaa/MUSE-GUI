@@ -38,6 +38,8 @@ class ConfigurationController(QObject):
         connection.result_received.connect(self._received)
         connection.state_changed.connect(self._state_changed)
         view.set_document(draft.document)
+        if connection.state['state'] != 'connected':
+            self.restore_cached_catalog(draft.document['catalog_id'])
 
     def _edit(self, operation, *args, **kwargs):
         self._editing = True
@@ -51,6 +53,10 @@ class ConfigurationController(QObject):
     def _draft_changed(self, revision):
         if not self._editing:
             self.view.set_document(self.draft.document)
+            catalog_id = self.draft.document['catalog_id']
+            if (self.connection.state['state'] != 'connected' and catalog_id is not None
+                    and (self.view._catalog is None or self.view._catalog['catalog_id'] != catalog_id)):
+                self.restore_cached_catalog(catalog_id)
 
     def _commit_input(self, path, value, pending_path, pending_subtree):
         self._edit(self.draft.commit_input, path, value, pending_path=path_text(pending_path),
@@ -70,7 +76,41 @@ class ConfigurationController(QObject):
         self.view.set_catalog(schema=schema, training_packages=training_packages, networks=networks,
                               entity_models=entity_models, controllers=controllers, sensors=sensors,
                               catalog_id=self.connection.state["catalog_id"])
-        self.view.set_document(self.draft.document)
+        self.view.catalog_status.setText('在线目录 · Catalog ' + str(self.connection.state['catalog_id']))
+
+    def restore_cached_catalog(self, catalog_id):
+        """只发布同Catalog的完整显示目录；不恢复inspection或validated_revision。"""
+        if catalog_id is None:
+            return
+        catalog, records = {}, []
+        self._catalog_requests.clear()
+        self.view.clear_catalog()
+        try:
+            for key, path in self.CATALOG_PATHS.items():
+                offset = 0
+                while True:
+                    params = None if key == 'schema' else {'offset': offset, 'limit': 50}
+                    record = self.connection.cached(path, params=params, catalog_id=catalog_id)
+                    if record is None:
+                        self.view.catalog_status.setText(f'离线 · Catalog {catalog_id} 缓存不完整：{path} / {offset}；请连接后刷新。')
+                        return
+                    records.append(record)
+                    if key == 'schema':
+                        catalog[key] = record['data']
+                        break
+                    catalog.setdefault(key, []).extend(record['data']['items'])
+                    offset = record['data']['next_offset']
+                    if offset is None:
+                        break
+            self.view.set_catalog(**catalog, catalog_id=catalog_id)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+            self.view.clear_catalog()
+            self.view.catalog_status.setText(f'离线 · Catalog {catalog_id} 缓存读取失败：{error}')
+            return
+        self.view.catalog_status.setText(f'离线缓存 · Catalog {catalog_id} / API 2 · 来源 '
+            + ', '.join(sorted({record['source'] for record in records}))
+            + ' · 保存时间 ' + min(record['saved_at'] for record in records)
+            + ' ～ ' + max(record['saved_at'] for record in records) + '；仅供显示/编辑，检查与运行需连接后端。')
 
     def _state_changed(self, state):
         if state["state"] == "connected" and self._catalog_generation != state["generation"]:
@@ -78,8 +118,12 @@ class ConfigurationController(QObject):
         elif state["state"] != "connected":
             self._inspection = None
             self.view.mark_stale()
+            self.restore_cached_catalog(self.draft.document['catalog_id'] or state['catalog_id'])
 
     def refresh_catalog(self):
+        if self.connection.state['state'] != 'connected':
+            self.restore_cached_catalog(self.draft.document['catalog_id'] or self.connection.state['catalog_id'])
+            return
         self._catalog_generation = self.connection.state["generation"]
         self._catalog = {}
         self._catalog_requests = {}
@@ -144,7 +188,7 @@ class ConfigurationController(QObject):
             self.view.show_error("检查失败：" + str(result["error"]))
             return
         report = result["data"]
-        self.draft.mark_validated(revision, report)
+        self.draft.mark_validated(revision)
         self.view.show_report(report)
         self.report_received.emit(deepcopy(report))
 

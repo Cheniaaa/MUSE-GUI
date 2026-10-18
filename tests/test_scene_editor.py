@@ -198,6 +198,149 @@ def test_unplaced_entities_are_not_previewed_and_pending_box_can_cancel(qapp):
     view.close()
 
 
+@pytest.fixture
+def empty_scene(qapp):
+    from muse_gui.scene.scene_controller import SceneController
+    from muse_gui.scene.scene_editor_view import SceneEditorView
+    view = SceneEditorView()
+    draft, connection, viewer = ExperimentDraft(), Connection(), Viewer()
+    controller = SceneController(draft, connection, view, viewer, parent=view)
+    for owned in (draft, connection, viewer):
+        owned.setParent(view)
+    yield draft, view, controller, connection, viewer
+    controller.close_preview()
+
+
+@pytest.mark.parametrize('previous_environment', [None, 'old-env', 'env'])
+def test_explicit_preview_restore_loads_environment_selected_while_hidden(empty_scene, previous_environment):
+    draft, view, controller, connection, viewer = empty_scene
+    if previous_environment is not None:
+        draft.set_value(('request',), {'environment_id': previous_environment, 'environment_revision': 1})
+        token = connection.requests[-1][0]
+        connection.result_received.emit(1, token, {'ok': True, 'data': {
+            'base': {**BASE, 'resource_id': previous_environment}, 'objects': []}})
+    controller.close_preview()
+    connection.requests.clear()
+    draft.set_value(('request',), {'environment_id': 'env', 'environment_revision': 1})
+    assert connection.requests == []
+
+    controller.refresh_preview()
+    if previous_environment != 'env':
+        manifests = [item for item in connection.requests
+                     if item[1:3] == ('GET', '/catalog/environments/env/1/editing')]
+        assert manifests, '显式恢复应取得隐藏期间选择的环境manifest'
+        connection.result_received.emit(1, manifests[-1][0], {'ok': True, 'data': {'base': BASE, 'objects': []}})
+        controller.flush_preview()
+    post = next(item for item in connection.requests if item[1:3] == ('POST', '/previews'))
+    assert post[3]['json']['environment'] == BASE
+    assert viewer.opens == []
+
+
+def test_explicit_preview_rebuild_recovers_failed_manifest(empty_scene):
+    draft, view, controller, connection, viewer = empty_scene
+    draft.set_value(('request',), {'environment_id': 'env', 'environment_revision': 1})
+    token = connection.requests[-1][0]
+    connection.result_received.emit(1, token, {'ok': False, 'error': {'message': 'manifest unavailable'}})
+    assert 'manifest unavailable' in view.message.text()
+    connection.requests.clear()
+
+    controller.refresh_preview()
+    manifests = [item for item in connection.requests
+                 if item[1:3] == ('GET', '/catalog/environments/env/1/editing')]
+    assert manifests, '失败后用户显式重建应重新取得manifest'
+    connection.result_received.emit(1, manifests[-1][0], {'ok': True, 'data': {'base': BASE, 'objects': []}})
+    controller.flush_preview()
+    post = next(item for item in connection.requests if item[1:3] == ('POST', '/previews'))
+    assert post[3]['json']['environment'] == BASE
+
+
+@pytest.mark.parametrize('invalidation', ['hidden_epoch', 'connection_generation'])
+def test_preview_restore_ignores_late_manifest_from_old_context(empty_scene, invalidation):
+    draft, view, controller, connection, viewer = empty_scene
+    draft.set_value(('request',), {'environment_id': 'env', 'environment_revision': 1})
+    old_token = connection.requests[-1][0]
+    if invalidation == 'hidden_epoch':
+        controller.close_preview()
+        draft.set_value(('request', 'environment_id'), 'new-env')
+        controller.refresh_preview()
+        base = {**BASE, 'resource_id': 'new-env'}
+    else:
+        connection.state = {'state': 'disconnected', 'generation': 2}
+        connection.state_changed.emit(connection.state)
+        connection.state = {'state': 'connected', 'generation': 3}
+        connection.state_changed.emit(connection.state)
+        base = BASE
+    current_token = connection.requests[-1][0]
+    connection.requests.clear()
+
+    connection.result_received.emit(1, old_token, {'ok': True, 'data': {'base': BASE, 'objects': []}})
+    controller.flush_preview()
+    assert connection.requests == []
+    assert viewer.opens == []
+    connection.result_received.emit(connection.state['generation'], current_token, {
+        'ok': True, 'data': {'base': base, 'objects': []}})
+    controller.flush_preview()
+    post = next(item for item in connection.requests if item[1:3] == ('POST', '/previews'))
+    assert post[3]['json']['environment'] == base
+
+
+@pytest.mark.parametrize('action', ['duplicate', 'remove', 'tree_delete', 'page_delete'])
+def test_pending_box_blocks_committed_object_intents(qapp, action):
+    from qfluentwidgets import PushButton
+    from muse_gui.scene.scene_editor_view import SceneEditorView
+    view = SceneEditorView()
+    item = dict(label=BOX['label'], editable=True, reason=None, kind='environment', box=BOX, pose=POSE)
+    duplicates, removals = QSignalSpy(view.duplicate_requested), QSignalSpy(view.remove_requested)
+
+    def invoke():
+        if action in ('duplicate', 'remove'):
+            label = '复制box' if action == 'duplicate' else '删除'
+            button = next(button for button in view.findChildren(PushButton) if button.text() == label)
+            button.click()
+        else:
+            QTest.keyClick(view.tree if action == 'tree_delete' else view, Qt.Key.Key_Delete)
+
+    view.set_object('candidate', item, pending=True)
+    invoke()
+    assert duplicates.count() == removals.count() == 0
+    assert view.confirm_button.isEnabled()
+    if action in ('duplicate', 'remove'):
+        label = '复制box' if action == 'duplicate' else '删除'
+        assert not next(button for button in view.findChildren(PushButton) if button.text() == label).isEnabled()
+
+    view.set_object('committed', item)
+    invoke()
+    signal = duplicates if action == 'duplicate' else removals
+    assert signal.count() == 1 and signal.at(0) == ['committed']
+
+
+def test_duplicate_box_confirm_and_delete_remain_single_undo_operations(qapp, monkeypatch):
+    from qfluentwidgets import PushButton
+    draft, view, controller, connection, viewer = editor(qapp)
+    monkeypatch.setattr(view, 'confirm_removal', lambda impacts: True)
+    controller.select('box-1')
+    before, count = draft.document, draft.undo_stack.count()
+    duplicate = next(button for button in view.findChildren(PushButton) if button.text() == '复制box')
+    duplicate.click()
+    assert draft.document == before and draft.undo_stack.count() == count
+    view.confirm_button.click()
+    identity = controller.selected
+    assert identity != 'box-1'
+    assert draft.document['environment_edit']['upserts'][identity]['label'] == 'box 副本'
+    assert draft.undo_stack.count() == count + 1
+    draft.undo_stack.undo()
+    assert draft.document == before
+    draft.undo_stack.redo()
+    controller.select(identity)
+    remove = next(button for button in view.findChildren(PushButton) if button.text() == '删除')
+    remove.click()
+    assert identity not in draft.document['environment_edit']['upserts']
+    assert draft.undo_stack.count() == count + 2
+    draft.undo_stack.undo()
+    assert identity in draft.document['environment_edit']['upserts']
+    controller.close_preview()
+
+
 def test_preview_submission_is_throttled_to_latest(qapp, wait_until):
     draft, view, controller, connection, viewer = editor(qapp)
     controller.set_pose('box-1', {'position': [2., 2., 3.], 'orientation_wxyz': POSE['orientation_wxyz']})

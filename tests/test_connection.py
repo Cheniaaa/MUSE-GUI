@@ -73,13 +73,17 @@ def test_reconnect_changes_generation_and_catalog(tmp_path, wait_until):
     with controller_for(tmp_path, wait_until, handle) as controller:
         received = QSignalSpy(controller.result_received)
         controller.connect({"base_url": "http://a", "catalog_id": "catalog-a"})
-        wait_until(lambda: controller.state["state"] == "connected" and controller.cached("/catalog/environments") is not None)
+        wait_until(lambda: controller.state["state"] == "connected")
+        controller.request("environments", "GET", "/catalog/environments")
+        wait_until(lambda: controller.cached("/catalog/environments") is not None)
         old_generation = controller.state["generation"]
         controller.request("late", "GET", "/slow")
         wait_until(entered.is_set)
         controller.connect({"base_url": "http://b", "catalog_id": "catalog-b"})
         try:
-            wait_until(lambda: controller.state["state"] == "connected" and controller.cached("/catalog/environments") is not None)
+            wait_until(lambda: controller.state["state"] == "connected")
+            controller.request("environments", "GET", "/catalog/environments")
+            wait_until(lambda: controller.cached("/catalog/environments") is not None)
             assert controller.state["generation"] > old_generation
             assert controller.state["catalog_id"] == "catalog-b"
             assert controller.state["binding_required"] is True
@@ -156,6 +160,8 @@ def test_structured_http_error_does_not_become_connection_failure(tmp_path, wait
 def test_offline_cache_is_not_resolved_input(tmp_path, wait_until):
     with controller_for(tmp_path, wait_until, response_for) as controller:
         controller.connect({"base_url": "http://a", "catalog_id": "catalog-a"})
+        wait_until(lambda: controller.state["state"] == "connected")
+        controller.request("schema", "GET", "/catalog/schema")
         wait_until(lambda: controller.cached("/catalog/schema") is not None)
         controller.disconnect()
         cached = controller.cached("/catalog/schema")
@@ -176,7 +182,7 @@ def test_offline_cache_is_not_resolved_input(tmp_path, wait_until):
         assert reopened.cached("/catalog/schema", catalog_id="catalog-b") is None
 
 
-def test_restart_refreshes_runs_and_catalog_without_changing_run_state(tmp_path, wait_until):
+def test_restart_publishes_identity_without_prefetching_business_data(tmp_path, wait_until):
     instance = ["instance-1"]
     seen = []
     worker_threads, signal_threads = [], []
@@ -195,8 +201,7 @@ def test_restart_refreshes_runs_and_catalog_without_changing_run_state(tmp_path,
         wait_until(lambda: not controller.has_pending_requests)
         assert controller.state["instance_id"] == "instance-2"
         assert controller.state["generation"] > first
-        assert ("instance-2", "/catalog/schema") in seen
-        assert ("instance-2", "/runs") in seen
+        assert seen == [("instance-1", "/health"), ("instance-2", "/health")]
         assert controller.state["last_seen"]
         assert "run_state" not in controller.state
         assert set(signal_threads) == {get_ident()}
@@ -226,6 +231,8 @@ def test_cache_keeps_pages_separate(tmp_path, wait_until):
         return response_for(request)
     with controller_for(tmp_path, wait_until, handle) as controller:
         controller.connect({"base_url": "http://a"})
+        wait_until(lambda: controller.state["state"] == "connected")
+        controller.request("environments", "GET", "/catalog/environments")
         wait_until(lambda: controller.cached("/catalog/environments") is not None)
         controller.request("page-two", "GET", "/catalog/environments", params={"offset": 10})
         wait_until(lambda: controller.cached("/catalog/environments", params={"offset": 10}) is not None)
@@ -287,6 +294,8 @@ def test_unsubscribe_stops_idle_stream_without_disconnect(tmp_path, wait_until, 
 def test_cache_from_previous_instance_is_stale_until_refetched(tmp_path, wait_until):
     with controller_for(tmp_path, wait_until, response_for) as controller:
         controller.connect({"base_url": "http://a"})
+        wait_until(lambda: controller.state["state"] == "connected")
+        controller.request("schema", "GET", "/catalog/schema")
         wait_until(lambda: controller.cached("/catalog/schema") is not None)
     entered, release = Event(), Event()
     def restarted(request):
@@ -297,6 +306,8 @@ def test_cache_from_previous_instance_is_stale_until_refetched(tmp_path, wait_un
     with controller_for(tmp_path, wait_until, restarted) as controller:
         controller.connect({"base_url": "http://a"})
         try:
+            wait_until(lambda: controller.state["state"] == "connected")
+            controller.request("schema", "GET", "/catalog/schema")
             wait_until(entered.is_set)
             assert controller.cached("/catalog/schema")["offline"] is True
             release.set()
@@ -312,12 +323,15 @@ def test_cache_write_error_is_reported_not_hidden(tmp_path, wait_until):
     with controller_for(blocked, wait_until, response_for) as controller:
         received = QSignalSpy(controller.result_received)
         controller.connect({"base_url": "http://a"})
+        wait_until(lambda: controller.state["state"] == "connected")
+        controller.request("schema", "GET", "/catalog/schema")
         wait_until(lambda: not controller.has_pending_requests)
         results = [received.at(i)[2] for i in range(received.count())
-                   if received.at(i)[1] == "refresh:/catalog/schema"]
+                   if received.at(i)[1] == "schema"]
         assert len(results) == 1
-        assert results[0]["ok"] is False
-        assert results[0]["error"]["kind"] == "local"
+        assert results[0]["ok"] is True
+        assert results[0]["data"]["title"] == "catalog-a"
+        assert results[0]["cache_error"]["kind"] == "local"
         assert controller.state["state"] == "connected"
 
 

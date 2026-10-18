@@ -123,6 +123,40 @@ def test_changed_source_requires_explicit_version_choice(components, tmp_path, w
     assert not submission.busy
 
 
+@pytest.mark.parametrize("choice", ["registered", None, "update"])
+def test_registered_reference_does_not_depend_on_local_archive(components, tmp_path, wait_until, monkeypatch, choice):
+    from muse_gui.catalog import package_archive
+
+    draft, connection, resources, submission = components
+    source = tmp_path / "unreadable-package"
+    source.mkdir()
+    resources.remember_source({"resource_id": "package", "revision": 1, "sha256": "registered-hash", "kind": "training_package"}, source)
+    archives = []
+
+    def unreadable_archive(*args):
+        archives.append(args)
+        raise PermissionError("source is unreadable")
+
+    monkeypatch.setattr(package_archive, "build_archive", unreadable_archive)
+    failures = []
+    submission.failed.connect(lambda stage, error: failures.append((stage, error)))
+    captured = draft.document["request"]
+    submission.start({"mode": "TRAIN", "max_decision_steps": 10}, choice)
+    wait_until(lambda: bool(failures or connection.requests))
+    if choice == "registered":
+        assert not failures
+        assert not archives
+        assert connection.requests[-1][1:3] == ("POST", "/experiments")
+        assert connection.requests[-1][3]["json"] == captured
+        assert not list(resources.archive_dir.iterdir())
+        submission.cancel()
+        connection.answer("/experiments", {"experiment_id": "saved"})
+    else:
+        assert failures[-1][0] == "source_check"
+        assert "source is unreadable" in str(failures[-1][1])
+        assert not connection.requests
+
+
 def test_update_upload_is_once_and_edited_draft_is_not_overwritten(components, tmp_path, wait_until):
     draft, connection, resources, submission = components
     source = tmp_path / "package"
@@ -451,12 +485,10 @@ def test_resources_view_real_async_registration_and_local_source_binding(qapp, t
         association = resources.source_for("environment", record["resource_id"], record["revision"])
         assert association["path"] == str(source.absolute())
         assert association["reference"]["sha256"] == expected["sha256"]
-        checked = []
-        resources.source_checked.connect(checked.append)
         resources.check_source(record)
-        wait_until(lambda: bool(checked))
-        assert checked[0]["state"] == "unchanged"
-        Path(".superpowers/integration/2026-10-18/g4-real-resource-view.json").write_text(json.dumps({"registered": record, "association": association, "checked": checked[0]}, ensure_ascii=False, indent=2), encoding="utf-8")
+        wait_until(lambda: resources.status.text().startswith("unchanged /"))
+        assert expected["sha256"] in resources.status.text()
+        Path(".superpowers/integration/2026-10-18/g4-real-resource-view.json").write_text(json.dumps({"registered": record, "association": association, "status": resources.status.text()}, ensure_ascii=False, indent=2), encoding="utf-8")
     finally:
         wait_until(resources.close_operations)
         wait_until(lambda: connection.close(20))

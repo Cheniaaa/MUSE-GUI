@@ -189,6 +189,18 @@ class ConnectionController(QObject):
         if not file.exists():
             return None
         result = json.loads(file.read_text(encoding="utf-8"))
+        if (not isinstance(result, dict) or result.get("catalog_id") != identity
+                or result.get("api_revision") != 2 or result.get("path") != path
+                or result.get("params") != params or not isinstance(result.get("data"), dict)
+                or not all(isinstance(result.get(key), str) and result[key]
+                           for key in ("instance_id", "source", "saved_at"))):
+            raise ValueError("缓存身份或记录格式无效")
+        if params is not None and "offset" in params:
+            page = result["data"]
+            if (not isinstance(page.get("items"), list) or "next_offset" not in page
+                    or page["next_offset"] is not None and (
+                        type(page["next_offset"]) is not int or page["next_offset"] <= params["offset"])):
+                raise ValueError("缓存分页记录格式无效")
         result["offline"] = (self._state["state"] != "connected" or identity != self._state["catalog_id"]
                              or result["instance_id"] != self._state["instance_id"])
         return result
@@ -209,7 +221,12 @@ class ConnectionController(QObject):
         key = (generation, request_id)
         if key in self._requests:
             raise ValueError(f"请求尚未结束: {request_id}")
-        self._requests[key] = (method, path, params)
+        if method == "GET" and path.startswith("/catalog/"):
+            # 同一缓存页以最新发起的请求为准，晚到旧响应仍交由各界面的token过滤。
+            for previous, metadata in self._requests.items():
+                if metadata[:3] == (method, path, params):
+                    self._requests[previous] = (*metadata[:3], False)
+        self._requests[key] = (method, path, params, True)
         self._start(_RequestWorker(self._client, generation, request_id, method, operation, self))
 
     def _start(self, worker):
@@ -255,11 +272,11 @@ class ConnectionController(QObject):
         self._set_state(last_seen=datetime.now(timezone.utc).isoformat())
         if request_id == "health":
             self._accept_health(result["data"])
-        elif metadata is not None and metadata[0] == "GET" and metadata[1].startswith("/catalog/"):
+        elif metadata is not None and metadata[0] == "GET" and metadata[1].startswith("/catalog/") and metadata[3]:
             try:
                 self._save_cache(metadata[1], metadata[2], result["data"])
             except OSError as error:
-                result = {"ok": False, "error": _failure(error, "CACHE")}
+                result["cache_error"] = _failure(error, "CACHE")
         self.result_received.emit(generation, request_id, result)
 
     def _accept_health(self, health):
@@ -281,9 +298,6 @@ class ConnectionController(QObject):
                                    "expected": expected, "actual": catalog})
             return
         self._set_state(state="connected", error=None)
-        # 每次连接都重新取真值；重启后不能沿用旧 Run 或目录快照。
-        for path in ("/catalog/schema", "/catalog/environments", "/catalog/training-packages", "/runs"):
-            self.request(f"refresh:{path}", "GET", path)
 
     def _cache_file(self, catalog_id, path, params):
         identity = sha256(catalog_id.encode()).hexdigest()

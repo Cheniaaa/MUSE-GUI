@@ -90,9 +90,7 @@ def _remove_slot(request, group_id, slot):
 
 
 class SceneController(QObject):
-    selection_changed = Signal(str)
     error = Signal(dict)
-    preview_changed = Signal(dict)
 
     def __init__(self, draft, connection, view, viewer, parent=None):
         super().__init__(parent)
@@ -228,7 +226,6 @@ class SceneController(QObject):
         self.view.flush_inputs()
         self.selected = object_id
         self._show_object()
-        self.selection_changed.emit(object_id)
         self._intent('select', object_id)
 
     def set_pose(self, object_id, pose):
@@ -473,7 +470,6 @@ class SceneController(QObject):
                         if identity in self.objects:
                             self.selected = identity
                             self._show_object()
-                            self.selection_changed.emit(identity)
             return
         pending = self._requests.pop(token, None)
         if pending is None or pending[1] != generation or generation != self.connection.state['generation']:
@@ -517,7 +513,6 @@ class SceneController(QObject):
             + ('；旧图已过期' if self.stale else '；静态编译初态，非episode reset')
             + ('；sensor省略：' + str(state['sensor_omissions']) if state['sensor_omissions'] else '')
             + ('；' + str(state['error']) if state['error'] else ''))
-        self.preview_changed.emit(deepcopy(state))
 
     def _intent(self, kind, object_id=None, **kwargs):
         if self._stream and self.preview_status == 'ready' and (object_id is None or object_id in self._compiled):
@@ -554,6 +549,8 @@ class SceneController(QObject):
     def refresh_preview(self):
         self._release()
         self._enabled = True
+        if self._manifest is None:
+            self._manifest_key = None
         self._changed()
         self.flush_preview()
 

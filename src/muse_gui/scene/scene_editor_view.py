@@ -120,9 +120,9 @@ class SceneEditorView(QWidget):
         add = PushButton('新增box', self)
         add.clicked.connect(lambda: self.add_requested.emit({'label': '长方体', 'size_m': [1., 1., 1.],
             'collision': True, 'rf_blocking': False, 'pose': None}))
-        duplicate = PushButton('复制box', self)
+        duplicate = self.duplicate_button = PushButton('复制box', self)
         duplicate.clicked.connect(lambda: self.duplicate_requested.emit(self._selected) if self._selected else None)
-        remove = PushButton('删除', self)
+        remove = self.remove_button = PushButton('删除', self)
         remove.clicked.connect(lambda: self.remove_requested.emit(self._selected) if self._selected else None)
         for index, button in enumerate((add, duplicate, remove, self.confirm_button, cancel)):
             actions.addWidget(button, index // 2, index % 2)
@@ -196,6 +196,8 @@ class SceneEditorView(QWidget):
             checkbox.setChecked(inputs[key] == 'true' if checkbox is not self.visible and key in inputs else checked)
             checkbox.setEnabled(item is not None if checkbox is self.visible else editable and box is not None)
         self.confirm_button.setEnabled(pending)
+        self.duplicate_button.setEnabled(not pending)
+        self.remove_button.setEnabled(not pending)
         with QSignalBlocker(self.tree):
             for index in range(self.tree.topLevelItemCount()):
                 row = self.tree.topLevelItem(index)
@@ -274,7 +276,7 @@ class SceneEditorView(QWidget):
                 or event.matches(QKeySequence.StandardKey.Redo)):
             # 路由由实际接收控件决定，不读取其它窗口可能尚未更新的全局文本焦点。
             if event.key() == Qt.Key.Key_Delete:
-                if self._selected:
+                if self._selected and not self._pending:
                     self.remove_requested.emit(self._selected)
             elif event.matches(QKeySequence.StandardKey.Undo):
                 self.undo_requested.emit()
@@ -292,8 +294,9 @@ class SceneEditorView(QWidget):
             return super().keyPressEvent(event)
         if event.key() == Qt.Key.Key_Escape:
             self.placement_cancelled.emit()
-        elif event.key() == Qt.Key.Key_Delete and self._selected:
-            self.remove_requested.emit(self._selected)
+        elif event.key() == Qt.Key.Key_Delete:
+            if self._selected and not self._pending:
+                self.remove_requested.emit(self._selected)
         elif event.matches(QKeySequence.StandardKey.Undo):
             self.undo_requested.emit()
         elif event.matches(QKeySequence.StandardKey.Redo):

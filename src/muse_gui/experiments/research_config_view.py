@@ -13,7 +13,6 @@ from .schema_editor import SchemaEditor, at, path_text
 
 
 class ResearchConfigView(QWidget):
-    value_committed = Signal(tuple, object)
     input_committed = Signal(tuple, object, tuple, bool)
     override_removed = Signal(tuple)
     pending_changed = Signal(str, object)
@@ -43,6 +42,9 @@ class ResearchConfigView(QWidget):
         self.status_label = BodyLabel("尚未取得 Server schema；可继续打开或保存草稿。", self)
         self.status_label.setWordWrap(True)
         self.layout().addWidget(self.status_label)
+        self.catalog_status = BodyLabel("", self)
+        self.catalog_status.setWordWrap(True)
+        self.layout().addWidget(self.catalog_status)
         self.model_combos = {}
         self.model_rows = {}
         for kind in ("radio", "sensing"):
@@ -84,6 +86,21 @@ class ResearchConfigView(QWidget):
         self.inspect_button.setEnabled(True)
         if self._document is not None:
             self.set_document(self._document)
+
+    def clear_catalog(self):
+        self._catalog = self.report = None
+        self.mark_stale()
+        self._clear(self.forms)
+        self._clear(self.errors_host)
+        self._editors = []
+        self.selection_editors = {}
+        self.fixed_editor = self.run_editor = None
+        with QSignalBlocker(self.composition_combo):
+            self.composition_combo.clear()
+        for row in self.model_rows.values():
+            row.hide()
+        self.details_view.clear()
+        self.inspect_button.setEnabled(False)
 
     @property
     def descriptor(self):
@@ -229,7 +246,6 @@ class ResearchConfigView(QWidget):
             groups = at(self._document, ("request", "scenario", "entity_groups"), [])
             if isinstance(groups, list):
                 editor.excluded_paths = {("request", "scenario", "entity_groups", index, "sensor_config") for index in range(len(groups))}
-        editor.value_committed.connect(self.value_committed.emit)
         editor.input_committed.connect(self.input_committed.emit)
         editor.override_removed.connect(self.override_removed.emit)
         editor.pending_changed.connect(self.pending_changed.emit)
@@ -250,13 +266,11 @@ class ResearchConfigView(QWidget):
             yield ("world",), kind, composition.get("world_" + kind + "_terms", [])
 
     def _choices(self, request):
+        # 只消费 SDK 声明的引用位置；原始草稿的错误结构仍由 schema 控件呈现。
         choices = {}
-        scenario = request.get("scenario", {})
-        if not isinstance(scenario, dict):
-            return choices
-        groups = scenario.get("entity_groups", [])
+        groups = at(request, ("scenario", "entity_groups"), [])
         if not isinstance(groups, list):
-            return choices
+            groups = []
         models = self._catalog["entity_models"]
         for index, group in enumerate(groups):
             if not isinstance(group, dict):
@@ -268,35 +282,64 @@ class ResearchConfigView(QWidget):
                 for field, entries, identity, allowed in (("sensor_profile_id", self._catalog["sensors"], "sensor_profile_id", "sensor_profile_ids"), ("controller_id", self._catalog["controllers"], "id", "controller_ids")):
                     choices[(*base, field)] = [(entry[identity], entry[identity]) for entry in entries if entry[identity] in model["metadata"][allowed]]
         groups = [group for group in groups if isinstance(group, dict)]
-        group_choices = [(group["group_id"], group["group_id"]) for group in groups if "group_id" in group]
-        endpoints = request.get("scenario", {}).get("radio_geometry") or {}
-        endpoint_choices = [(name, name) for name in endpoints.get("endpoints", {})]
-        resources = [(item["resource_id"], item["resource_id"]) for item in (request.get("scenario", {}).get("network") or {}).get("resources", []) if "resource_id" in item]
-        links = [(item["link_id"], item["link_id"]) for item in endpoints.get("links", []) if "link_id" in item]
+        group_choices = [(group["group_id"], group["group_id"]) for group in groups if isinstance(group.get("group_id"), str)]
+        geometry_path = ("request", "scenario", "radio_geometry")
+        endpoints = at(request, (*geometry_path[1:], "endpoints"), {})
+        if not isinstance(endpoints, dict):
+            endpoints = {}
+        endpoint_choices = [(name, name) for name in endpoints]
+        for name, endpoint in endpoints.items():
+            if not isinstance(endpoint, dict):
+                continue
+            base = (*geometry_path, "endpoints", name)
+            choices[(*base, "group_id")] = group_choices
+            group = next((group for group in groups if group.get("group_id") == endpoint.get("group_id")), None)
+            model = next((model for model in models if group and (model["resource_id"], model["revision"]) == (group.get("model_id"), group.get("model_revision"))), None)
+            if model:
+                choices[(*base, "device_id")] = [(name, name) for name in model["metadata"]["radio_devices"]]
+        geometry_links = at(request, (*geometry_path[1:], "links"), [])
+        if not isinstance(geometry_links, list):
+            geometry_links = []
+        links = [(item["link_id"], item["link_id"]) for item in geometry_links if isinstance(item, dict) and isinstance(item.get("link_id"), str)]
+        for kind in ("links", "sensing"):
+            entries = at(request, (*geometry_path[1:], kind), [])
+            if not isinstance(entries, list):
+                continue
+            for index, entry in enumerate(entries):
+                if not isinstance(entry, dict):
+                    continue
+                base = (*geometry_path, kind, index)
+                for field in ("tx", "rx"):
+                    choices[(*base, field)] = endpoint_choices
+                if kind == "sensing":
+                    choices[(*base, "target", "group_id")] = group_choices
 
-        def visit(node, path):
-            if isinstance(node, dict):
-                for key, value in node.items():
-                    current = (*path, key)
-                    if key == "group_id" and "entity_groups" not in path:
-                        choices[current] = group_choices
-                    elif key in ("tx", "rx"):
-                        choices[current] = endpoint_choices
-                    elif key == "device_id":
-                        group = next((group for group in groups if group.get("group_id") == node.get("group_id")), None)
-                        model = next((model for model in models if group and (model["resource_id"], model["revision"]) == (group.get("model_id"), group.get("model_revision"))), None)
-                        if model:
-                            choices[current] = [(name, name) for name in model["metadata"].get("radio_devices", {})]
-                    elif key == "link_id" and "communication_allocations" in path or key == "link_id" and "services" in path:
-                        choices[current] = links
-                    elif key in ("resource_ids", "endpoints", "passive_endpoints") and isinstance(value, list):
-                        for index in range(len(value)):
-                            choices[(*current, index)] = resources if key == "resource_ids" else endpoint_choices
-                    visit(value, current)
-            elif isinstance(node, list):
-                for index, value in enumerate(node):
-                    visit(value, (*path, index))
-        visit(request, ("request",))
+        network_path = ("request", "scenario", "network")
+        resource_entries = at(request, (*network_path[1:], "resources"), [])
+        resources = [(item["resource_id"], item["resource_id"]) for item in resource_entries if isinstance(item, dict) and isinstance(item.get("resource_id"), str)] if isinstance(resource_entries, list) else []
+        reference_lists = {(*network_path, "passive_endpoints"): endpoint_choices}
+        limits = at(request, (*network_path[1:], "endpoint_limits"), {})
+        if isinstance(limits, dict):
+            for name in limits:
+                reference_lists[(*network_path, "endpoint_limits", name, "resource_ids")] = resources
+        for kind in ("background_emitters", "communication_allocations", "services"):
+            entries = at(request, (*network_path[1:], kind), [])
+            if not isinstance(entries, list):
+                continue
+            for index, entry in enumerate(entries):
+                if not isinstance(entry, dict):
+                    continue
+                base = (*network_path, kind, index)
+                if kind == "background_emitters":
+                    reference_lists[(*base, "endpoints")] = endpoint_choices
+                else:
+                    choices[(*base, "link_id")] = links
+                    reference_lists[(*base, "resource_ids")] = resources
+        for path, options in reference_lists.items():
+            values = at(request, path[1:])
+            if isinstance(values, list):
+                for index in range(len(values)):
+                    choices[(*path, index)] = options
         if self.composition:
             for role in self.composition.get("agent_roles", {}):
                 choices[("request", "role_config", role, "group_id")] = group_choices

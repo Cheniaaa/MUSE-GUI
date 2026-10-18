@@ -41,7 +41,6 @@ def deref(node, root):
 
 
 class SchemaEditor(QWidget):
-    value_committed = Signal(tuple, object)
     input_committed = Signal(tuple, object, tuple, bool)
     override_removed = Signal(tuple)
     pending_changed = Signal(str, object)
@@ -90,7 +89,6 @@ class SchemaEditor(QWidget):
     def _commit(self, path, value, pending_path, pending_subtree):
         self.effective_current = False
         self.input_committed.emit(path, value, pending_path, pending_subtree)
-        self.value_committed.emit(path, value)
 
     def _remove(self, path):
         self.override_removed.emit(path)
