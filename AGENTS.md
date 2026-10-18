@@ -5,7 +5,7 @@
 
 MUSE GUI 是 Muse 的研究工作台：同一研究者编写研究代码、编辑草稿、配置场景、提交 Run 并查看结果。客户端通过 HTTP/WebSocket 连接 Muse Server，使用 Qt WebEngine 内嵌后端 Viser。
 
-新工作台正在按 `docs/superpowers/plans/2026-10-18-muse-research-workbench.md` 的 G1–G8 实施；不能把界面骨架当成完整产品验收。交互和模块边界见 `docs/superpowers/specs/2026-10-18-muse-research-workbench-design.md`。
+正式工作台按 `docs/superpowers/plans/2026-10-18-muse-research-workbench.md` 的 G1–G8 实施；实际联合验收状态见后端 `docs/validation/m5-research-workbench.md`。交互和模块边界见 `docs/superpowers/specs/2026-10-18-muse-research-workbench-design.md`。
 
 后端及联合进度的唯一记录在 `\\wsl.localhost\Ubuntu-24.04\project\mjc_ws\.planning\mjlab-spike\gui_execution.md`；共享契约和 B0–B9 计划在该后端工程的 `docs/superpowers/`。子代理只维护分配的报告，不创建另一套主计划。
 
@@ -21,7 +21,7 @@ MUSE GUI 是 Muse 的研究工作台：同一研究者编写研究代码、编�
 python -m pip install -r requirements.txt
 python -m pip install --no-deps -e .
 python -m pytest tests -q
-# 新工作台开发入口，功能完成范围以实施记录为准。
+# 正式工作台入口，验收范围以联合记录为准。
 python -m muse_gui
 ```
 
@@ -59,7 +59,7 @@ python -m muse_gui
 ## 实施与旧文件清理
 
 - 新增类/字段须有当期消费者；输入校验有明确边界和唯一所有者。复用成熟库及已验证内部契约，不增加不必要的兼容、兜底、硬编码、重复校验或通用框架。
-- 旧 `src/main.py`、`views/`、`controllers/`、`models/`、`config/` 属于待替换的 FlySim/Gateway 业务，已保存本地基线 `3cc31f8`。新包不得导入它们作为兼容层。
-- 按 G8 在新流程贯通后做引用检查，只删除已被完全替代且无消费者的旧业务/入口；保留无关 demo 和资源，不提前批量删除旧目录。
+- 旧 `src/main.py`、`views/`、`controllers/`、`models/`、`config/` 的15个 FlySim/Gateway 业务文件已在新流程贯通及引用检查后删除，历史保留于本地基线 `3cc31f8`。不恢复旧业务作为兼容层。
+- 无关 demo 和资源保留；后续清理仍只处理本期替代且无消费者的文件。
 - 同一文件只有一个写入者；主代理负责共享接口、集成、Git 暂存和本地提交，用户手动 push。保持现有忽略规则；文档、环境和 `.superpowers` 证据本地保留。
 - 行为测试采用 RED→最小实现→GREEN；不为目录或文案制造测试。GPU 验收由主代理串行执行，最终仅一次跨项目独立整体审查。
