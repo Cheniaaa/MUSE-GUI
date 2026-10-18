@@ -34,7 +34,7 @@ python -m pip install --no-deps -e .
 
 ## 范围与验证
 
-当前联合验收：唯一整体审查的4项 Important 已修复，此前最终 GUI **254 passed / 6 skipped**。三参考六个 TRAIN/EVALUATE 及功能 INTERACTIVE（48步、77.51秒）已完成。最新另批的性能Run在脚本显示就绪检查处停止，累计10个 Run＝7成功＋3取消；headless已取得完整30秒样本，display尚未采样。脚本异步就绪等待已无Run复现并修正，未自动重试；完整浏览器稳态对照仍未完成，B9保持部分验收。
+当前联合验收：唯一整体审查的4项 Important 已修复，此前最终 GUI **254 passed / 6 skipped**。三参考六个 TRAIN/EVALUATE 及功能 INTERACTIVE（48步、77.51秒）已完成。最新真实CPU草稿预览确认模型显示、相机操作和持续绘制正常；此前性能脚本误把0×0二维选择框层当成三维canvas，已修正取证对象。Run集合仍为10个＝7成功＋3取消；headless有完整30秒样本，display性能尚未采样，完整B9仍部分验收。
 
 正式源码位于 `src/muse_gui/`，按功能分为 `app/backend/experiments/catalog/scene/runs/widgets`。研究代码只由后端验证/运行进程加载，GUI 不 import 研究包，也不拥有物理循环。
 
