@@ -15,6 +15,8 @@ from qfluentwidgets import (
 
 
 class WorkbenchView(QWidget):
+    flush_requested = Signal()
+    page_changed = Signal(str)
     context_changed = Signal(str, str)
     new_requested = Signal()
     open_requested = Signal()
@@ -29,11 +31,13 @@ class WorkbenchView(QWidget):
         self._contexts = [("draft", self.context_identity)]
         self._page = "scene"
         self._expanded_height = 180
+        self.configuration_view = None
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 12, 16, 10)
         root.setSpacing(10)
 
         header = QHBoxLayout()
+        self.document_actions = header
         title = QVBoxLayout()
         title.setSpacing(3)
         title.addWidget(CaptionLabel("MUSE  /  RESEARCH WORKBENCH", self))
@@ -113,9 +117,10 @@ class WorkbenchView(QWidget):
             item = QTreeWidgetItem(scene, [text])
             item.setData(0, Qt.ItemDataRole.UserRole, "scene")
         config = QTreeWidgetItem(self.tree, ["研究配置"])
-        for text in ("组合与研究组件", "角色 / 观测 / 奖励", "cost 与终止条件", "无线 / 感知模型", "运行参数"):
+        for text, section in (("组合与研究组件", "composition"), ("角色 / 观测 / 奖励", "selections"), ("cost 与终止条件", "costs"), ("无线 / 感知模型", "models"), ("运行参数", "execution")):
             item = QTreeWidgetItem(config, [text])
             item.setData(0, Qt.ItemDataRole.UserRole, "config")
+            item.setData(0, Qt.ItemDataRole.UserRole + 1, section)
         self.tree.expandAll()
         self.tree.itemClicked.connect(self._tree_clicked)
         tree_layout.addWidget(self.tree, 1)
@@ -148,13 +153,13 @@ class WorkbenchView(QWidget):
 
         self.inspector_panel = CardWidget(self)
         self.inspector_panel.setClickEnabled(False)
-        self.inspector_panel.setMinimumWidth(210)
+        self.inspector_panel.setMinimumWidth(330)
         inspector = QVBoxLayout(self.inspector_panel)
         inspector.setContentsMargins(12, 12, 10, 8)
         self.inspector_heading = StrongBodyLabel("属性与上下文 · 草稿", self)
         inspector.addWidget(self.inspector_heading)
         self.inspector_host = self._host("contextInspectorHost", "尚未选择对象", "选择对象或研究组件后，在这里查看属性、来源与约束。", FIF.INFO)
-        inspector.addWidget(self._scroll(self.inspector_host), 1)
+        inspector.addWidget(self.inspector_host, 1)
         self.horizontal_splitter.addWidget(self.inspector_panel)
         self.horizontal_splitter.setStretchFactor(1, 1)
 
@@ -247,8 +252,39 @@ class WorkbenchView(QWidget):
 
     def flush_inputs(self):
         if not self.read_only:
+            self.flush_requested.emit()
             self.draft.set_value(("name",), self.name_edit.text())
             self.name_edit.setModified(False)
+            if self.configuration_view is not None:
+                self.configuration_view.flush()
+
+    def set_configuration_view(self, view):
+        layout = self.draft_config_host.layout()
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.setParent(None)
+                widget.deleteLater()
+        self.configuration_view = view
+        view.inspect_button.setText("检查")
+        view.inspect_button.setAccessibleName("检查当前草稿")
+        view.inspect_button.setFixedWidth(80)
+        self.document_actions.insertWidget(self.document_actions.indexOf(self.save_button), view.inspect_button)
+        view.inspect_button.setVisible(not self.read_only)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.addWidget(view)
+        inspector = self.inspector_host.layout()
+        inspector.setContentsMargins(0, 0, 0, 0)
+        while inspector.count():
+            item = inspector.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.setParent(None)
+                widget.deleteLater()
+        inspector.addWidget(view.details_view)
+        view.details_view.setVisible(self._page == "config" and not self.read_only)
+        self.messages_host.layout().insertWidget(1, self._scroll(view.errors_host), 1)
 
     def _draft_changed(self, revision):
         if not self.read_only:
@@ -284,6 +320,8 @@ class WorkbenchView(QWidget):
         changed = (kind, identity) != (self.context_kind, self.context_identity)
         self.context_kind, self.context_identity = kind, identity
         self.name_edit.setReadOnly(self.read_only)
+        if self.configuration_view is not None:
+            self.configuration_view.inspect_button.setVisible(not self.read_only)
         self.name_edit.setText("Run · " + identity if self.read_only else self.draft.document["name"])
         self.tree_heading.setText("实验内容 · " + ("Run 只读" if self.read_only else "草稿"))
         self.tree_note.setText("冻结输入 · 只读观察" if self.read_only else "一份活动草稿\n改动仅用于下一次运行")
@@ -304,11 +342,22 @@ class WorkbenchView(QWidget):
         self._page = page
         self.page_tabs.setCurrentItem(page)
         self.central_stack.setCurrentIndex((2 if self.read_only else 0) + (page == "config"))
+        if self.configuration_view is not None:
+            self.configuration_view.details_view.setVisible(page == "config" and not self.read_only)
+        self.page_changed.emit(page)
+
+    def close_run_context(self, identity: str):
+        index = self._contexts.index(('run', identity))
+        self.set_context('draft', self.draft.document['draft_id'])
+        self._contexts.pop(index)
+        self.context_tabs.removeTab(index)
 
     def _tree_clicked(self, item, column):
         page = item.data(0, Qt.ItemDataRole.UserRole)
         if page:
             self.set_page(page)
+        if page == "config" and self.configuration_view is not None and not self.read_only:
+            self.configuration_view.focus_section(item.data(0, Qt.ItemDataRole.UserRole + 1))
 
     def set_output_collapsed(self, collapsed: bool) -> None:
         if collapsed and hasattr(self, "output_collapsed") and not self.output_collapsed:
@@ -324,7 +373,7 @@ class WorkbenchView(QWidget):
     def restore_layout(self) -> None:
         self.tree_panel.show()
         self.inspector_panel.show()
-        self.horizontal_splitter.setSizes([205, 700, 255])
+        self.horizontal_splitter.setSizes([205, 625, 330])
         self._expanded_height = 180
         self.set_output_collapsed(True)
 

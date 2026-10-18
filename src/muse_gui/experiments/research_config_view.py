@@ -87,7 +87,7 @@ class ResearchConfigView(QWidget):
 
     @property
     def descriptor(self):
-        if self._document["catalog_id"] not in (None, self._catalog["catalog_id"]):
+        if self._catalog is None or self._document["catalog_id"] not in (None, self._catalog["catalog_id"]):
             return None
         request = self._document["request"]
         return next((record["metadata"] for record in self._catalog["training_packages"]

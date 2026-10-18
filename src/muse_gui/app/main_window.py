@@ -1,13 +1,14 @@
 from importlib.resources import files
 from pathlib import Path
 
+from PySide6.QtCore import QTimer
 from PySide6.QtGui import QAction, QIcon, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QLineEdit, QPlainTextEdit, QTextEdit, QVBoxLayout, QWidget,
 )
 from qfluentwidgets import (
     BodyLabel, ComboBox, FluentIcon as FIF, FluentWindow, MessageBox,
-    MessageBoxBase, NavigationItemPosition, PushButton, SubtitleLabel,
+    MessageBoxBase, NavigationItemPosition, PushButton, SubtitleLabel, qrouter,
 )
 
 from .workbench_view import WorkbenchView
@@ -41,6 +42,15 @@ class MuseWindow(FluentWindow):
         self.preferences = preferences
         self._after_save = None
         self._close_after_save = False
+        self._close_confirmed = False
+        stacked = self.stackedWidget
+
+        def release_routes():
+            # 固定Fluent Router保留强引用且无注销方法；只清除此窗口拥有的已销毁stack。
+            qrouter.stackHistories.pop(stacked, None)
+            qrouter.history[:] = [item for item in qrouter.history if item.stacked is not stacked]
+
+        stacked.destroyed.connect(release_routes)
         self.resize(1280, 800)
         self.setMinimumSize(1080, 640)
         self.setWindowTitle("Muse · 研究工作台")
@@ -200,13 +210,17 @@ class MuseWindow(FluentWindow):
         dialog.cancelButton.hide()
         dialog.exec()
 
+    def prepare_resources_close(self):
+        """入口组装后替换为本客户端的资源收口；空白本地工作台没有后台资源。"""
+        return True
+
     def closeEvent(self, event):
         self.workbench.flush_inputs()
         if self.draft.saving:
             self._close_after_save = True
             event.ignore()
             return
-        if self.draft.dirty:
+        if self.draft.dirty and not self._close_confirmed:
             choice = self._ask_unsaved()
             if choice == "cancel":
                 event.ignore()
@@ -216,5 +230,11 @@ class MuseWindow(FluentWindow):
                 self._close_after_save = True
                 self.save_draft()
                 return
+        self._close_confirmed = True
+        if not self.prepare_resources_close():
+            self.setEnabled(False)
+            event.ignore()
+            QTimer.singleShot(100, self.close)
+            return
         self.preferences.save_window(self, self.workbench)
         super().closeEvent(event)

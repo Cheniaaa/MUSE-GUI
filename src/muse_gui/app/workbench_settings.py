@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QSettings, Qt
+from PySide6.QtGui import QGuiApplication
 from qfluentwidgets import Theme, setTheme
 
 
@@ -13,6 +14,9 @@ class WorkbenchSettings:
         return self.settings.value("appearance/theme", "auto")
 
     def set_theme(self, theme: str) -> None:
+        QGuiApplication.styleHints().setColorScheme({
+            "auto": Qt.ColorScheme.Unknown, "light": Qt.ColorScheme.Light, "dark": Qt.ColorScheme.Dark,
+        }[theme])
         setTheme({"auto": Theme.AUTO, "light": Theme.LIGHT, "dark": Theme.DARK}[theme], save=False)
         self.settings.setValue("appearance/theme", theme)
 
