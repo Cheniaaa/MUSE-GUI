@@ -34,7 +34,7 @@ python -m pip install --no-deps -e .
 
 ## 范围与验证
 
-当前联合验收：GUI 自动测试224项通过；三参考场景的六个 TRAIN/EVALUATE 短程闭环通过。第七个 INTERACTIVE 因第二视图配对超时已取消，G6/G8/B9 最终出口及一次整体审查尚未完成，未自动重试。
+当前联合验收：GUI 自动测试224项通过；三参考场景的六个 TRAIN/EVALUATE 短程闭环通过。第七个 INTERACTIVE 配对超时，用户另批的一次续验在实体快照等待超时，均已取消。脚本布局与客户端跨通道协调已修正，最后定向44项通过，但没有再运行真实 INTERACTIVE；G6/G8/B9 最终出口及一次整体审查尚未完成，没有自动重试或追加 Run。
 
 正式源码位于 `src/muse_gui/`，按功能分为 `app/backend/experiments/catalog/scene/runs/widgets`。研究代码只由后端验证/运行进程加载，GUI 不 import 研究包，也不拥有物理循环。
 

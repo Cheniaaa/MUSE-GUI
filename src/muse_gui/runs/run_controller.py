@@ -83,6 +83,8 @@ class RunController(QObject):
             return
         self.state.invalidate_entities("显示请求在途；等待当前选择的新帧")
         self.state.display_pending = True
+        self._pending = {token: value for token, value in self._pending.items()
+                         if value[1:3] != (self._epoch, "entities_get")}
         self._request("display_patch", "PATCH", self._path("/display"), json=patch)
         self.changed.emit()
 
@@ -247,17 +249,31 @@ class RunController(QObject):
             elif data["kind"] == "checkpoint":
                 self._request("artifacts", "GET", self._path("/artifacts"))
         elif operation in {"display", "display_patch"}:
+            was_pending = state.display_pending
             if operation == "display_patch":
                 state.display_pending = False
-            first = state.display is None
+            previous = state.display
             state.apply_display(data)
-            if first:
-                self._request("entities_get", "GET", self._path("/entities"))
+            changed = previous is None or any(previous[key] != state.display[key]
+                                              for key in ("selection_seq", "effective_seq"))
+            if changed or (was_pending and not state.display_pending):
+                # WS 新帧可能先于 display ACK 到达并被拒；暂停时不会再推送相同快照。
+                # 旧 GET 也不能复用：它可能返回旧选择的 unavailable，清掉当前实体。
+                self._pending = {token: value for token, value in self._pending.items()
+                                 if value[1:3] != (self._epoch, "entities_get")}
+                if not state.display_pending:
+                    self._request("entities_get", "GET", self._path("/entities"))
+            if previous is None:
                 if not state.terminal:
                     self._subscribe("entities", f"/streams/runs/{quote(state.run_id, safe='')}/entities")
             self._sync_view()
         elif operation in {"entities", "entities_get"}:
             state.apply_entities(data)
+            if (operation == "entities" and data["available"] and state.entities["available"]
+                    and state.entities["frame"] == data["frame"]):
+                # 当前有效 WS 快照已完成协调；在途 GET 的旧 unavailable 不能再覆盖它。
+                self._pending = {token: value for token, value in self._pending.items()
+                                 if value[1:3] != (self._epoch, "entities_get")}
         elif operation == "command":
             state.submitting_command = False
             state.command_sync_required = False

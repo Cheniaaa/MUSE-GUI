@@ -290,6 +290,122 @@ def test_display_inflight_and_old_http_read_cannot_restore_previous_world(runnin
     assert controller.state.entities["frame"]["world_id"] == 2
 
 
+@pytest.mark.parametrize("arrival", ["before_patch", "before_effective_ack", "poll_before_patch"])
+def test_paused_display_reconciles_entities_rejected_before_ack(qapp, arrival):
+    connection, host = OrderedConnection(), Host()
+    controller = RunController(connection, host)
+    view = RunView(controller)
+    command = {"command_seq": 1, "command": "pause", "world_id": None}
+    paused = {"command": command, "result": {**command, "status": "applied", "paused": True,
+                                              "steps": 0, "updates": 0}}
+    initial = display(world=0, seq=1)
+    initial["requested"]["rate_hz"] = initial["effective"]["rate_hz"] = 10.
+    initial["interaction"] = paused
+    current = entities(frame(world=0, seq=2, episode=0, decision=0))
+    applied = display(world=0, seq=2)
+    applied["requested"]["rate_hz"] = applied["effective"]["rate_hz"] = 7.
+    applied.update(frame=current["frame"], interaction=paused)
+    try:
+        controller.open("r")
+        connection.answer("/runs/r", record(interaction=paused))
+        connection.answer("/experiments/e", {"topology": {"world_count": 2}})
+        connection.answer("/runs/r/display", initial)
+        connection.answer("/runs/r/entities", entities(frame(world=0, seq=1, episode=0, decision=0)))
+        view.objects_table.selectRow(0)
+        assert "position" in view.object_details.toPlainText()
+        controller.set_display({"enabled": True, "world_id": 0, "rate_hz": 7.})
+        if arrival == "before_effective_ack":
+            connection.answer("/runs/r/display", {**applied, "effective_seq": 1}, method="PATCH")
+        elif arrival == "poll_before_patch":
+            controller.refresh()
+            connection.answer("/runs/r/display", applied)
+        # Server 只发送这一个真实快照；暂停不推进，不靠第二条 WS 解锁。
+        connection.push("/entities", current)
+        assert not controller.state.entities["available"]
+        assert "position" not in view.object_details.toPlainText()
+        if arrival == "before_effective_ack":
+            controller.refresh()
+            connection.answer("/runs/r/display", applied)
+        else:
+            # poll 可先读到 applied；随后 PATCH 的旧 pending 快照不能回退真值。
+            response = {**applied, "effective_seq": 1} if arrival == "poll_before_patch" else applied
+            connection.answer("/runs/r/display", response, method="PATCH")
+        reads = [r for r in connection.requests if r[2] == "/runs/r/entities" and r[0] in controller._pending]
+        assert len(reads) == 1, "display ACK 后须有一次新的实体真值读取"
+        connection.result_received.emit(1, reads[0][0], {"ok": True, "data": deepcopy(current)})
+        # 同 selection、旧 effective ACK 时发出的读取，也必须被 applied ACK 淘汰。
+        for old in connection.requests:
+            if old[2] == "/runs/r/entities" and old[0] != reads[0][0]:
+                connection.result_received.emit(1, old[0], {"ok": True,
+                    "data": entities(current["frame"], available=False)})
+        assert controller.state.entities == current
+        assert controller.state.display["effective_seq"] == 2
+        assert controller.state.paused is True and controller.state.interaction["result"]["steps"] == 0
+        assert "position" in view.object_details.toPlainText()
+        assert not any(r[1] == "POST" and r[2].endswith("/commands") for r in connection.requests)
+        # 同一 display 的常规轮询不能变成 entities 轮询或重试。
+        for _ in range(2):
+            controller.refresh()
+            connection.answer("/runs/r/display", applied)
+            assert not controller._has_pending("entities_get")
+    finally:
+        controller.close_tab("r")
+        view.close()
+
+
+@pytest.mark.parametrize("old_result", ["available", "unavailable", "error"])
+def test_display_reconciliation_discards_superseded_entities_get(running, old_result):
+    connection, _, controller, view = running
+    controller.set_display({"world_id": 2})
+    connection.answer("/runs/r/display", display(2, 4), method="PATCH")
+    old = next(r for r in connection.requests if r[2] == "/runs/r/entities")
+    controller.set_display({"world_id": 0})
+    connection.answer("/runs/r/display", display(0, 5), method="PATCH")
+    fresh = next(r for r in connection.requests if r[2] == "/runs/r/entities" and r[0] != old[0])
+    current = entities(frame(world=0, seq=5, episode=0, decision=0))
+    connection.result_received.emit(1, fresh[0], {"ok": True, "data": deepcopy(current)})
+    view.objects_table.selectRow(0)
+    result = ({"ok": False, "error": {"message": "old read failed"}} if old_result == "error"
+              else {"ok": True, "data": entities(frame(world=2, seq=4), available=old_result == "available")})
+    connection.result_received.emit(1, old[0], result)
+    assert controller.state.entities == current
+    assert "position" in view.object_details.toPlainText()
+    assert controller.state.error is None
+    assert controller.poll_timer.isActive()
+
+
+@pytest.mark.parametrize("old_available", [True, False])
+def test_display_reconciliation_keeps_reset_and_entity_watermarks(running, old_available):
+    connection, _, controller, _ = running
+    controller.set_display({"world_id": 2})
+    connection.answer("/runs/r/display", display(2, 4), method="PATCH")
+    connection.push("/entities", entities(frame(world=2, seq=4, episode=2, decision=9)))
+    connection.push("/entities", entities(frame(world=2, seq=4, episode=3, decision=0)))
+    current = deepcopy(controller.state.entities)
+    connection.answer("/runs/r/entities", entities(frame(world=2, seq=4, episode=2, decision=99),
+                                                 available=old_available))
+    connection.push("/entities", entities(frame(world=1, seq=3, episode=99)))
+    connection.push("/entities", entities(frame(world=2, seq=4, episode=2, decision=100)))
+    assert controller.state.entities == current
+    controller.refresh()
+    connection.answer("/runs/r/display", {**display(2, 4), "frame": current["frame"]})
+    assert not controller._has_pending("entities_get")
+
+
+def test_display_reconciliation_unavailable_read_does_not_retry(running):
+    connection, _, controller, _ = running
+    controller.set_display({"world_id": 2})
+    applied = display(2, 4)
+    connection.answer("/runs/r/display", applied, method="PATCH")
+    connection.answer("/runs/r/entities", {"objects": [], "frame": None, "available": False,
+                                          "reason": "No live preview"})
+    for _ in range(2):
+        controller.refresh()
+        connection.answer("/runs/r/display", applied)
+        assert not controller._has_pending("entities_get")
+    assert not controller.state.entities["available"]
+
+
 def test_ack_event_before_http_pending_does_not_lose_applied_state(running):
     connection, _, controller, view = running
     controller.command("pause")
