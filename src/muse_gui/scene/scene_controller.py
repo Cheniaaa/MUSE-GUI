@@ -6,6 +6,8 @@ from uuid import uuid4
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 
+from muse_gui.experiments.schema_editor import at, path_text
+
 
 def _placement(request, group):
     """选中组修改共享placement时拆开引用，不能移动未选中的组。"""
@@ -294,19 +296,41 @@ class SceneController(QObject):
         self._pending_box = None
         self._render()
 
-    def _slot_pending_keys(self, group_id, slots):
+    def _slot_pending_keys(self, group_id, slots, before, after):
         pending = self.draft.document['pending_inputs']
-        return ['scene.' + identity for identity, obj in self.objects.items()
-                if obj['kind'] == 'entity' and obj['group_id'] == group_id and obj['slot'] >= min(slots)
-                and 'scene.' + identity in pending]
+        cancelled = ['scene.' + identity for identity, obj in self.objects.items()
+                     if obj['kind'] == 'entity' and obj['group_id'] == group_id and obj['slot'] >= min(slots)
+                     and 'scene.' + identity in pending]
+        # 只枚举_remove_slot实际写入的边界；列表结构沿用G3的整列表子树契约，不迁移raw路径。
+        groups = before['scenario']['entity_groups']
+        index = next(i for i, group in enumerate(groups) if group['group_id'] == group_id)
+        if len(after['scenario']['entity_groups']) < len(groups):
+            paths = [('scenario', 'entity_groups', i) for i in range(index, len(groups))]
+        else:
+            paths = [('scenario', 'entity_groups', index, field) for field in ('count', 'placement_id')]
+        # 共享placement会拆分；原placement未变时保留另一group仍拥有的输入。
+        for parent in (('scenario', 'placements'), ('scenario', 'command_targets_world'),
+                       ('scenario', 'network', 'endpoint_limits'), ('scenario', 'network', 'role_controls')):
+            paths.extend((*parent, name) for name in dict.fromkeys([*at(before, parent, {}), *at(after, parent, {})]))
+        for parent in (('role_config',), ('scenario', 'radio_geometry', 'endpoints')):
+            remaining = at(after, parent, {})
+            paths.extend((*parent, name, 'slots') if name in remaining else (*parent, name)
+                         for name in at(before, parent, {}))
+        paths += [('scenario', 'radio_geometry', field) for field in ('links', 'sensing')]
+        paths += [('scenario', 'network', field) for field in (
+            'passive_endpoints', 'background_emitters', 'communication_allocations', 'services')]
+        prefixes = ['request.' + path_text(path) for path in paths if at(before, path) != at(after, path)]
+        cancelled += [key for key in pending if any(key == prefix or key.startswith(prefix + '.')
+                      or prefix.startswith(key + '.') for prefix in prefixes)]
+        return cancelled
 
-    def _remove_impacts(self, request, group_id, slots):
+    def _remove_impacts(self, request, group_id, slots, cancelled):
         scenario = request.get('scenario', {})
         impacts = [f'{group_id}: 删除slot {sorted(slots)}；其后slot编号在同一次编辑重排。']
-        cancelled = self._slot_pending_keys(group_id, slots)
         if cancelled:
-            impacts.append('删除及slot重排影响的对象未完成输入将取消，撤销删除也不会恢复这些文本：'
-                           + ', '.join(key.removeprefix('scene.') for key in cancelled))
+            pending = self.draft.document['pending_inputs']
+            impacts.append('删除及slot重排影响的对象/配置未完成输入将取消，撤销删除也不会恢复这些文本：\n'
+                           + '\n'.join(f'{key} = {pending[key]!r}' for key in cancelled))
         for role, binding in request.get('role_config', {}).items():
             if binding.get('group_id') == group_id:
                 impacts.append('role / command target: ' + role + ' ' + str(binding.get('slots', [])))
@@ -330,15 +354,16 @@ class SceneController(QObject):
             return
         revision = self.draft.revision
         if obj['kind'] == 'entity':
-            request = self.draft.document['request']
-            impacts = self._remove_impacts(request, obj['group_id'], [obj['slot']])
-            cancelled = self._slot_pending_keys(obj['group_id'], [obj['slot']])
+            before = self.draft.document['request']
+            request = deepcopy(before)
+            _remove_slot(request, obj['group_id'], obj['slot'])
+            cancelled = self._slot_pending_keys(obj['group_id'], [obj['slot']], before, request)
+            impacts = self._remove_impacts(before, obj['group_id'], [obj['slot']], cancelled)
             if not self.view.confirm_removal(impacts):
                 return
             if self.draft.revision != revision:
                 self._fail('确认期间草稿已变，请重新检查删除影响')
                 return
-            _remove_slot(request, obj['group_id'], obj['slot'])
             self.selected = None
             self.draft.commit_input(('request',), request, pending_path='scene.' + object_id)
             for key in cancelled:
@@ -367,14 +392,15 @@ class SceneController(QObject):
             raise ValueError('实体数量不能为负')
         if count < old:
             revision = self.draft.revision
-            cancelled = self._slot_pending_keys(group_id, range(count, old))
-            if not self.view.confirm_removal(self._remove_impacts(request, group_id, list(range(count, old)))):
+            before = deepcopy(request)
+            for slot in range(old - 1, count - 1, -1):
+                _remove_slot(request, group_id, slot)
+            cancelled = self._slot_pending_keys(group_id, range(count, old), before, request)
+            if not self.view.confirm_removal(self._remove_impacts(before, group_id, list(range(count, old)), cancelled)):
                 return
             if revision != self.draft.revision:
                 self._fail('确认期间草稿已变，请重试')
                 return
-            for slot in range(old - 1, count - 1, -1):
-                _remove_slot(request, group_id, slot)
         else:
             group['count'] = count
         self.draft.set_value(('request',), request)

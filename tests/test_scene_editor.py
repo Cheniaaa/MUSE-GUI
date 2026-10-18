@@ -404,6 +404,149 @@ def type_scene_text(field, text):
     QTest.keyClicks(field, text)
 
 
+def stage_schema_input(draft, parent, path, text='-', *, kind='number'):
+    from muse_gui.experiments.schema_editor import SchemaEditor, at, path_text
+    schema = SchemaEditor(parent)
+    schema.value_reader = lambda path: at(draft.document, path)
+    schema.input_committed.connect(lambda path, value, origin, subtree: draft.commit_input(
+        path, value, pending_path=path_text(origin), pending_subtree=subtree))
+    schema.pending_changed.connect(draft.stage_input)
+    value = at(draft.document, path)
+    schema.set_section({'path': path, 'schema': {'type': kind}, 'effective': value,
+                        'origins': {}, 'missing': [], 'errors': []}, value, draft.document['pending_inputs'])
+    type_scene_text(schema.root_field.editor, text)
+    schema.flush()
+    assert draft.document['pending_inputs'][path_text(path)] == text
+    return schema
+
+
+@pytest.mark.parametrize('operation,slot', [('remove', 1), ('reduce', 2)])
+@pytest.mark.parametrize('confirmed', [False, True])
+def test_g3_pending_is_confirmed_and_cancelled_by_g5_structure(qapp, monkeypatch, operation, slot, confirmed):
+    draft, view, controller, connection, viewer = editor(qapp)
+    request = draft.document['request']
+    request['scenario']['placements']['other'] = [deepcopy(POSE)]
+    draft.set_value(('request',), request)
+    pose_path = ('request', 'scenario', 'placements', 'start', slot, 'position', 0)
+    count_path = ('request', 'scenario', 'entity_groups', 0, 'count')
+    other_path = ('request', 'scenario', 'placements', 'other', 0, 'position', 0)
+    stage_schema_input(draft, view, pose_path, '1e-')
+    stage_schema_input(draft, view, count_path)
+    stage_schema_input(draft, view, other_path)
+    stage_schema_input(draft, view, ('request', 'scenario', 'entity_groups', 0, 'model_revision'))
+    controller.select(f'entity/uav/{slot}')
+    type_scene_text(view.position_fields[0], '-')
+    controller.select('box-1')
+    type_scene_text(view.position_fields[0], '-')
+    draft.stage_input('request.private', 'unfinished')
+    before, count = draft.document, draft.undo_stack.count()
+    notices = []
+    monkeypatch.setattr(view, 'confirm_removal', lambda impacts: notices.extend(impacts) or confirmed)
+    if operation == 'remove':
+        controller.remove_object('entity/uav/0')
+    else:
+        controller.set_group_count('uav', 2)
+    if confirmed:
+        expected = {'scene.box-1': before['pending_inputs']['scene.box-1'], 'request.private': 'unfinished',
+                    'request.scenario.placements.other.0.position.0': '-',
+                    'request.scenario.entity_groups.0.model_revision': '-'}
+        assert draft.document['pending_inputs'] == expected
+        assert draft.undo_stack.count() == count + 1
+        draft.undo_stack.undo()
+        assert draft.document['request'] == before['request']
+        assert draft.document['pending_inputs'] == expected
+        draft.undo_stack.redo()
+        assert draft.document['pending_inputs'] == expected
+    else:
+        assert draft.document == before
+        assert draft.undo_stack.count() == count
+    notice = '\n'.join(notices)
+    assert f'request.scenario.placements.start.{slot}.position.0' in notice
+    assert 'request.scenario.entity_groups.0.count' in notice and '1e-' in notice
+    assert 'request.scenario.placements.other' not in notice
+    controller.close_preview()
+
+
+@pytest.mark.parametrize('operation', ['remove', 'reduce', 'remove_group'])
+def test_g5_shared_placement_keeps_g3_raw_for_unchanged_group(qapp, monkeypatch, operation):
+    draft, view, controller, connection, viewer = editor(qapp)
+    request = draft.document['request']
+    mirror = deepcopy(request['scenario']['entity_groups'][0])
+    mirror['group_id'] = 'mirror'
+    request['scenario']['entity_groups'].append(mirror)
+    draft.set_value(('request',), request)
+    stage_schema_input(draft, view, ('request', 'scenario', 'placements', 'start', 1, 'position', 0))
+    stage_schema_input(draft, view, ('request', 'scenario', 'placements'), '{"start":', kind='json')
+    stage_schema_input(draft, view, ('request', 'scenario', 'entity_groups', 0, 'count'))
+    stage_schema_input(draft, view, ('request', 'scenario', 'entity_groups', 1, 'count'))
+    monkeypatch.setattr(view, 'confirm_removal', lambda impacts: True)
+    before = draft.document['request']
+    if operation == 'remove':
+        controller.remove_object('entity/uav/0')
+    else:
+        controller.set_group_count('uav', 0 if operation == 'remove_group' else 2)
+    expected = {'request.scenario.placements.start.1.position.0': '-'}
+    if operation == 'remove_group':
+        expected['request.scenario.placements'] = '{"start":'
+    else:
+        expected['request.scenario.entity_groups.1.count'] = '-'
+    assert draft.document['pending_inputs'] == expected
+    assert draft.document['request']['scenario']['placements']['start'] == before['scenario']['placements']['start']
+    draft.undo_stack.undo()
+    assert draft.document['request'] == before
+    assert draft.document['pending_inputs'] == expected
+    controller.close_preview()
+
+
+def test_g5_last_slot_cancels_g3_reindexed_groups_and_removed_reference_lists(qapp, monkeypatch):
+    draft, view, controller, connection, viewer = editor(qapp)
+    request = draft.document['request']
+    mirror = deepcopy(request['scenario']['entity_groups'][0])
+    mirror['group_id'], mirror['placement_id'] = 'mirror', 'mirror_start'
+    request['scenario']['entity_groups'].append(mirror)
+    request['scenario']['placements']['mirror_start'] = [deepcopy(POSE)]
+    geometry = request['scenario']['radio_geometry']
+    geometry['links'] = [{'link_id': 'link', 'tx': 'tx', 'rx': 'tx', 'gain': 2.}]
+    request['scenario']['network'] = {
+        'endpoint_limits': {'tx': {'power': 1.}, 'other': {'power': 2.}},
+        'role_controls': {'pilot': 'tx'}, 'passive_endpoints': ['tx'],
+        'background_emitters': [{'endpoints': ['tx'], 'power': 1.}],
+        'communication_allocations': [{'link_id': 'link', 'rate': 1.}],
+        'services': [{'link_id': 'link', 'rate': 1.}]}
+    draft.set_value(('request',), request)
+    affected = [
+        ('scenario', 'entity_groups', 1, 'model_revision'),
+        ('role_config', 'pilot', 'slots', 0),
+        ('scenario', 'command_targets_world', 'pilot', 0, 0),
+        ('scenario', 'radio_geometry', 'endpoints', 'tx', 'slots', 0),
+        ('scenario', 'radio_geometry', 'links', 0, 'gain'),
+        ('scenario', 'radio_geometry', 'sensing', 0, 'target', 'slots', 0),
+        ('scenario', 'network', 'endpoint_limits', 'tx', 'power'),
+        ('scenario', 'network', 'background_emitters', 0, 'power'),
+        ('scenario', 'network', 'communication_allocations', 0, 'rate'),
+        ('scenario', 'network', 'services', 0, 'rate')]
+    for path in affected:
+        stage_schema_input(draft, view, ('request', *path))
+    stage_schema_input(draft, view, ('request', 'scenario', 'network', 'endpoint_limits', 'other', 'power'))
+    notices = []
+    monkeypatch.setattr(view, 'confirm_removal', lambda impacts: notices.extend(impacts) or True)
+    before = draft.document['request']
+    count = draft.undo_stack.count()
+    controller.set_group_count('uav', 0)
+    expected = {'request.scenario.network.endpoint_limits.other.power': '-'}
+    assert draft.document['pending_inputs'] == expected
+    assert draft.undo_stack.count() == count + 1
+    assert draft.document['request']['scenario']['entity_groups'][0]['group_id'] == 'mirror'
+    for path in affected:
+        assert '.'.join(map(str, ('request', *path))) in '\n'.join(notices)
+    draft.undo_stack.undo()
+    assert draft.document['request'] == before
+    assert draft.document['pending_inputs'] == expected
+    draft.undo_stack.redo()
+    assert draft.document['pending_inputs'] == expected
+    controller.close_preview()
+
+
 def test_scene_pending_survives_save_load_selection_and_unrelated_undo(qapp, tmp_path):
     draft, view, controller, connection, viewer = editor(qapp)
     controller.select('box-1')
