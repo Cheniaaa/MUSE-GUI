@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from hashlib import sha256
 import json
 from pathlib import Path
+from queue import Queue
 from threading import Event
 from time import monotonic
 
@@ -62,6 +63,7 @@ class _StreamWorker(QThread):
         self.request_id = request_id
         self.path = path
         self.stop_event = Event()
+        self.outbound = Queue()
 
     def run(self):
         try:
@@ -72,7 +74,7 @@ class _StreamWorker(QThread):
                                     {"ok": False, "error": _failure(error, "WS")})
 
     async def _consume(self):
-        async for event in self.client.stream(self.path, self.stop_event):
+        async for event in self.client.stream(self.path, self.stop_event, outbound=self.outbound):
             if self.stop_event.is_set():
                 return
             self.completed.emit(self.generation, self.request_id, {"ok": True, "data": event})
@@ -155,6 +157,17 @@ class ConnectionController(QObject):
         worker = self._streams.pop(request_id, None)
         if worker is not None:
             worker.stop_event.set()
+
+    def send_stream(self, request_id: str, message: dict) -> None:
+        """沿现有订阅发送控制消息；不建立第二条WS或在GUI线程等待网络。"""
+        if not self._require_connection(request_id):
+            return
+        worker = self._streams.get(request_id)
+        if worker is None:
+            self.result_received.emit(self._state["generation"], request_id,
+                {"ok": False, "error": {"kind": "local", "message": "控制订阅尚未建立或已关闭"}})
+            return
+        worker.outbound.put(deepcopy(message))
 
     def close(self, wait_ms: int = 1500) -> bool:
         """只回收客户端；返回 False 时宿主须保留 controller 并在稍后重试关闭。"""

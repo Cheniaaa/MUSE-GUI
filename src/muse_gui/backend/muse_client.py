@@ -4,6 +4,7 @@ import asyncio
 import json as json_module
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
+from queue import Empty, Queue
 from threading import Event
 from urllib.parse import urlsplit, urlunsplit
 
@@ -47,7 +48,7 @@ class MuseClient:
                 for chunk in response.iter_bytes():
                     output.write(chunk)
 
-    async def stream(self, path: str, stop_event: Event) -> AsyncIterator[dict]:
+    async def stream(self, path: str, stop_event: Event, *, outbound: Queue | None = None) -> AsyncIterator[dict]:
         if stop_event.is_set():
             return
         parsed = urlsplit(self._url(path))
@@ -55,6 +56,13 @@ class MuseClient:
                           parsed.path, parsed.query, ""))
         async with self._connect_factory(url, open_timeout=3.0, close_timeout=1.0) as websocket:
             while not stop_event.is_set():
+                if outbound is not None:
+                    while True:
+                        try:
+                            message = outbound.get_nowait()
+                        except Empty:
+                            break
+                        await websocket.send(json_module.dumps(message, ensure_ascii=False, allow_nan=False))
                 try:
                     raw = await asyncio.wait_for(websocket.recv(), timeout=0.25)
                 except TimeoutError:

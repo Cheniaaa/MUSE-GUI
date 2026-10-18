@@ -12,7 +12,29 @@ from muse_gui.backend.muse_client import MuseClient
 
 def health(catalog="catalog-a", instance="instance-1", revision=2):
     return {"status": "ok", "gpu_busy": False, "platform_revision": "0.2",
-            "api_revision": revision, "catalog_id": catalog, "instance_id": instance}
+             "api_revision": revision, "catalog_id": catalog, "instance_id": instance}
+
+
+def test_send_stream_uses_the_existing_control_socket(tmp_path, wait_until, websocket_server):
+    import json
+    seen = []
+    def socket_handler(ws):
+        ws.send(json.dumps({"kind": "state", "state": "ready"}))
+        seen.append(json.loads(ws.recv(timeout=3)))
+        ws.send(json.dumps({"kind": "view", "event": {"kind": "selection", "object_id": seen[0]["object_id"]}}))
+        ws.wait_closed()
+    with websocket_server(socket_handler) as port:
+        with controller_for(tmp_path, wait_until, response_for) as controller:
+            controller.connect({"base_url": f"http://127.0.0.1:{port}"})
+            wait_until(lambda: controller.state["state"] == "connected")
+            received = QSignalSpy(controller.result_received)
+            controller.subscribe("preview-control", "/streams/previews/p-1")
+            value = {"kind": "select", "object_id": "box-中文"}
+            controller.send_stream("preview-control", value)
+            value["object_id"] = "caller-mutated"
+            wait_until(lambda: any(received.at(i)[2].get("data", {}).get("kind") == "view" for i in range(received.count())))
+            assert seen == [{"kind": "select", "object_id": "box-中文"}]
+            controller.unsubscribe("preview-control")
 
 
 @contextmanager
