@@ -23,6 +23,8 @@ class WorkbenchController(QObject):
         self.window, self.draft, self.connection = window, draft, connection
         self.configuration = configuration
         self._view_context = None
+        self._run_catalog_id = None
+        self._visible_scene_context = None
         self._connected_generation = None
         self._new_run_ids = set()
         self.settings = SettingsView(window.preferences, window.settings_host)
@@ -81,6 +83,7 @@ class WorkbenchController(QObject):
         self.run_viewer = ViewerHost(workbench.run_scene_host)
         self.scene_view = SceneEditorView(workbench.inspector_host)
         self.scene = SceneController(self.draft, self.connection, self.scene_view, self.draft_viewer, self)
+        self.scene.close_preview()
         workbench.flush_requested.connect(self.scene_view.flush_inputs)
         self.run = RunController(self.connection, self.run_viewer, self)
         self.run_view = RunView(self.run, workbench.run_config_host)
@@ -110,6 +113,7 @@ class WorkbenchController(QObject):
         self.run_requested.connect(self.open_run)
         workbench.context_changed.connect(self._context_changed)
         workbench.page_changed.connect(self._page_changed)
+        self.window.stackedWidget.currentChanged.connect(lambda _: self._page_changed(workbench._page))
         self.close_tab_button = PushButton('关闭当前 Run 标签', workbench)
         self.close_tab_button.clicked.connect(self.close_current_run)
         workbench.document_actions.addWidget(self.close_tab_button)
@@ -129,14 +133,11 @@ class WorkbenchController(QObject):
             previous_kind, previous_id = self._view_context
             if previous_kind == 'run':
                 self.run.close_tab(previous_id)
-            else:
-                self.scene.close_preview()
         self._view_context = (kind, identity)
         if kind == 'run':
+            self._run_catalog_id = self.connection.state['catalog_id']
             self.run.open(identity, new_run=identity in self._new_run_ids)
             self._new_run_ids.discard(identity)
-        elif self.connection.state['state'] == 'connected':
-            self.scene.refresh_preview()
         if self.results is not None:
             if kind == 'draft':
                 self.results.controller.stop()
@@ -152,10 +153,23 @@ class WorkbenchController(QObject):
         self._page_changed(self.window.workbench._page)
 
     def _page_changed(self, page):
-        draft = self.window.workbench.context_kind == 'draft'
+        workbench = self.window.workbench
+        draft = workbench.context_kind == 'draft'
         self.scene_view.setVisible(draft and page == 'scene')
         self.scene_view.tree.setVisible(draft and page == 'scene')
         self.run_view.object_details.setVisible(not draft)
+        context = (workbench.context_kind, workbench.context_identity)
+        if context != self._view_context or self._closing:
+            return
+        visible = page == 'scene' and self.window.stackedWidget.currentWidget() is workbench
+        current = context if visible else None
+        self.run.set_view_visible(visible and not draft)
+        if current != self._visible_scene_context:
+            if self._visible_scene_context is not None and self._visible_scene_context[0] == 'draft':
+                self.scene.close_preview()
+            if current is not None and draft:
+                self.scene.refresh_preview()
+            self._visible_scene_context = current
 
     def close_current_run(self):
         workbench = self.window.workbench
@@ -204,6 +218,9 @@ class WorkbenchController(QObject):
             self.history.refresh()
             if not self.draft.document['request'] and self.draft.document['catalog_id'] is None:
                 self.draft.set_value(('catalog_id',), state['catalog_id'])
+            if (self._view_context is not None and self._view_context[0] == 'run'
+                    and self._run_catalog_id == state['catalog_id']):
+                self.run.open(self._view_context[1], new_run=False)
 
     def _replace_source(self, request, run_options, name):
         self.draft.replace_document(dict(format_version=1, draft_id=str(uuid4()), name=name,
@@ -223,26 +240,58 @@ class WorkbenchController(QObject):
         self.window._confirm_replace(lambda: self._replace_source(source, {}, '实验副本'))
 
     def select_resource(self, record):
-        if record['kind'] == 'training_package':
+        document = self.draft.document
+        catalog_id = self.connection.state['catalog_id']
+        cross_catalog = document['catalog_id'] not in (None, catalog_id)
+        kind = record['kind']
+        if kind == 'training_package' and not cross_catalog:
             if not self.configuration.select_package(record):
                 return
-            self.draft.set_value(('catalog_id',), self.connection.state['catalog_id'])
+            self.draft.set_value(('catalog_id',), catalog_id)
             self.window.switchTo(self.window.workbench)
             return
-        dialog = MessageBox('替换当前资源？', '草稿保留场景输入；研究包切换会清除组件覆盖并重新检查绑定。环境切换会清除尚未派生的环境编辑。', self.window)
-        if not dialog.exec():
+        cancelled = [key for key in document['pending_inputs']
+                     if (key.startswith('scene.') and not key.startswith('scene.entity/'))
+                     or key == 'environment_edit' or key.startswith('environment_edit.')
+                     or key in ('request', 'request.environment_id', 'request.environment_revision')
+                     or cross_catalog and key in ('request.training_package_id', 'request.training_package_revision',
+                                                  'run_options.checkpoint_artifact_id')
+                     or cross_catalog and kind == 'training_package' and any(
+                         key == 'request.' + field or key.startswith('request.' + field + '.')
+                         for field in self.configuration.CLEAR_ON_COMPOSITION)]
+        notice = '环境编辑及其未完成输入将取消；保留实体布局与其它输入。撤销不会恢复已确认取消的文本。'
+        if cancelled:
+            notice += '\n' + '\n'.join(key + ' = ' + document['pending_inputs'][key] for key in cancelled)
+        if cross_catalog:
+            notice += ('\n切换Catalog，清除旧研究包/环境/checkpoint引用，请重新选择缺项：\n'
+                       + json.dumps({key: document['request'].get(key) for key in
+                                     ('training_package_id', 'environment_id')}, ensure_ascii=False)
+                       + '\ncheckpoint: ' + str(document['run_options'].get('checkpoint_artifact_id'))
+                       + '\n选择新研究包会清除原研究组件覆盖及其未完成输入。')
+            if not self.configuration.confirm('重新绑定Catalog资源？', notice):
+                return
+        elif not MessageBox('替换当前环境？', notice, self.window).exec():
             return
         self.flush()
         document = self.draft.document
         request = document['request']
-        kind = record['kind']
-        request[kind + '_id'], request[kind + '_revision'] = record['resource_id'], record['revision']
         self.draft.undo_stack.beginMacro('选择研究资源')
         try:
-            self.draft.set_value(('catalog_id',), self.connection.state['catalog_id'])
-            self.draft.set_value(('request',), request)
+            for key in cancelled:
+                self.draft.stage_input(key, None)
+            if cross_catalog:
+                for field in ('training_package_id', 'training_package_revision', 'environment_id', 'environment_revision'):
+                    request.pop(field, None)
+                options = document['run_options']
+                options.pop('checkpoint_artifact_id', None)
+                self.draft.set_value(('run_options',), options)
             if kind == 'environment':
-                self.draft.set_value(('environment_edit',), {})
+                request['environment_id'], request['environment_revision'] = record['resource_id'], record['revision']
+            self.draft.set_value(('catalog_id',), catalog_id)
+            self.draft.set_value(('request',), request)
+            self.draft.set_value(('environment_edit',), {})
+            if kind == 'training_package':
+                self.configuration.select_package(record, confirmed=True)
         finally:
             self.draft.undo_stack.endMacro()
         self.configuration.refresh_catalog()

@@ -23,6 +23,7 @@ class RunController(QObject):
         self._new_run = False
         self._terminal_seen = False
         self._opened_url = None
+        self._view_visible = True
         self.poll_timer = QTimer(self)
         self.poll_timer.setInterval(500)
         self.poll_timer.timeout.connect(self.refresh)
@@ -124,6 +125,16 @@ class RunController(QObject):
             self._sync_view()
             self.changed.emit()
 
+    def set_view_visible(self, visible: bool) -> None:
+        """隐藏仅回收本客户端网页，Run观察、命令和共享显示继续。"""
+        if visible == self._view_visible:
+            return
+        self._view_visible = visible
+        if visible:
+            self._sync_view()
+        else:
+            self._release_view()
+
     def navigation_context(self, checkpoint_artifact_id: str | None = None) -> dict:
         return deepcopy({"run_id": self.state.run_id, "experiment_id": self.state.record["experiment_id"],
                          "record": self.state.record, "source": self.state.source,
@@ -161,7 +172,7 @@ class RunController(QObject):
 
     def _sync_view(self):
         state = self.state
-        if not self.active or not state.connected or state.terminal:
+        if not self.active or not self._view_visible or not state.connected or state.terminal:
             return
         display = state.display
         if display is None or not display["effective"]["enabled"] or not display["viewer_url"]:
@@ -284,6 +295,10 @@ class RunController(QObject):
                              if value[1:3] != (self._epoch, "run")}
             state.apply_snapshot(data)
         elif operation == "register":
+            if not self._view_visible:
+                identity = data["view_id"]
+                self._request("delete:" + identity, "DELETE", self._path("/display/clients/") + quote(identity, safe=""))
+                return
             self.view_id = data["view_id"]
             self._subscribe("view", f"/streams/runs/{quote(state.run_id, safe='')}/view?view_id={quote(self.view_id, safe='')}")
             self._sync_view()

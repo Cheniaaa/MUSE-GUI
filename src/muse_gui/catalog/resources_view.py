@@ -33,6 +33,7 @@ class ResourcesView(QWidget):
         self._items = {key: [] for key in self.PATHS}
         self._next = {key: None for key in self.PATHS}
         self._page_epoch = 0
+        self._catalog_id = connection.state['catalog_id']
         self._closing = False
         layout = QVBoxLayout(self)
         row = QHBoxLayout()
@@ -235,7 +236,15 @@ class ResourcesView(QWidget):
             self.editing_ready.emit(deepcopy(result["data"]))
 
     def _connection_changed(self, state):
-        if state["state"] != "connected":
+        if state["state"] == "connected" and state['catalog_id'] != self._catalog_id:
+            self._catalog_id = state['catalog_id']
+            self._page_epoch += 1
+            self._items = {key: [] for key in self.PATHS}
+            self._next = {key: None for key in self.PATHS}
+            self.table.clearSelection()
+            self.details.clear()
+            self._render()
+        elif state["state"] != "connected":
             # G1 可先发同代连接失败，再给原请求发送精确错误；不提前吞掉该结果。
             self._requests = {token: data for token, data in self._requests.items() if data[0] == state["generation"]}
             for operation in self._operations.values():

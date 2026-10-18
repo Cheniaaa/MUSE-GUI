@@ -184,13 +184,13 @@ class ConfigurationController(QObject):
             request.pop(key, None)
         return [path_text(("request", key)) for key in self.CLEAR_ON_COMPOSITION]
 
-    def select_package(self, record: dict) -> bool:
-        """ResourcesView 选择的真实 package record；确认与组件覆盖清理只在此归属。"""
+    def select_package(self, record: dict, *, confirmed: bool = False) -> bool:
+        """选择真实package；跨Catalog确认由app合并，组件覆盖清理仍归本域。"""
         request = self.draft.document["request"]
         selected = (request.get("training_package_id"), request.get("training_package_revision"))
         if selected == (record["resource_id"], record["revision"]):
             return True
-        if not self.confirm("切换研究包？", "将删除研究组件覆盖及其未完成文本，并选择新包声明的默认组合；场景、绑定、seed、RunOptions 保留，绑定需重新检查。"):
+        if not confirmed and not self.confirm("切换研究包？", "将删除研究组件覆盖及其未完成文本，并选择新包声明的默认组合；场景、绑定、seed、RunOptions 保留，绑定需重新检查。"):
             return False
         self.view.flush()
         request = self.draft.document["request"]
