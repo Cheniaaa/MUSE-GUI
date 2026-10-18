@@ -1,3 +1,9 @@
 /resources/Icon/
 /test/
 /AGENTS.md
+/.venv/
+/.superpowers/
+/docs/
+__pycache__/
+.pytest_cache/
+*.egg-info/
