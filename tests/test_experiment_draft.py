@@ -173,3 +173,72 @@ def test_validation_is_separate_from_save_and_undo(qapp, tmp_path):
     draft.undo_stack.undo()
     assert draft.validated_revision != draft.revision
     assert draft.dirty
+
+
+def test_atomic_input_command_preserves_interleaved_field_and_missing_parents(qapp):
+    draft = ExperimentDraft()
+    initial = draft.document
+    revision = draft.revision
+    draft.stage_input("request.task_config.a", "2")
+    assert draft.revision == revision + 1
+    assert draft.undo_stack.count() == 0
+    draft.set_value(("request", "task_config", "b"), 3)
+    draft.commit_input(("request", "task_config", "a"), 2, pending_path="request.task_config.a")
+    assert draft.undo_stack.count() == 2
+    draft.undo_stack.undo()
+    assert draft.document["request"]["task_config"] == {"b": 3}
+    assert not draft.document["pending_inputs"]
+    draft.undo_stack.undo()
+    assert draft.document == initial
+    draft.undo_stack.redo()
+    draft.undo_stack.redo()
+    assert draft.document["request"]["task_config"] == {"a": 2, "b": 3}
+    assert not draft.document["pending_inputs"]
+
+
+def test_commit_same_value_only_finishes_staging_without_empty_undo(qapp, tmp_path):
+    draft = ExperimentDraft()
+    draft.set_value(("request", "root_seed"), 7)
+    draft.save(tmp_path / "baseline.muse.json")
+    index = draft.undo_stack.index()
+    draft.stage_input("request.root_seed", "7")
+    assert draft.dirty
+    revision = draft.revision
+    draft.commit_input(("request", "root_seed"), 7, pending_path="request.root_seed")
+    assert draft.revision == revision + 1
+    assert draft.undo_stack.index() == index
+    assert not draft.dirty
+
+
+def test_reset_input_subtree_is_atomic_and_cannot_restore_stale_raw(qapp):
+    draft = ExperimentDraft()
+    path = ("request", "task_config")
+    draft.set_value(path, {"nullable": None, "values": [3]})
+    draft.stage_input("request.task_config.nullable", "-")
+    draft.stage_input("request.task_config.values.0", "1e-")
+    draft.stage_input("request.other", "keep")
+    draft.remove_override(path, pending_prefix="request.task_config")
+    assert "task_config" not in draft.document["request"]
+    assert draft.document["pending_inputs"] == {"request.other": "keep"}
+    draft.undo_stack.undo()
+    assert draft.document["request"]["task_config"] == {"nullable": None, "values": [3]}
+    assert draft.document["pending_inputs"] == {"request.other": "keep"}
+    draft.undo_stack.redo()
+    assert "task_config" not in draft.document["request"]
+    assert draft.document["pending_inputs"] == {"request.other": "keep"}
+
+
+def test_atomic_union_type_choice_is_not_an_empty_numeric_edit(qapp, tmp_path):
+    draft = ExperimentDraft()
+    path = ("request", "task_config", "value")
+    draft.set_value(path, 7)
+    draft.save(tmp_path / "integer.muse.json")
+    draft.stage_input("request.task_config.value", "7.0")
+    draft.commit_input(path, 7., pending_path="request.task_config.value")
+    assert type(draft.document["request"]["task_config"]["value"]) is float
+    assert draft.dirty
+    draft.undo_stack.undo()
+    assert type(draft.document["request"]["task_config"]["value"]) is int
+    assert not draft.document["pending_inputs"]
+    draft.undo_stack.redo()
+    assert type(draft.document["request"]["task_config"]["value"]) is float

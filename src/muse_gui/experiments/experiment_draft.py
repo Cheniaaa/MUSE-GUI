@@ -9,6 +9,48 @@ from PySide6.QtCore import QIODevice, QObject, QSaveFile, QThread, Signal
 from PySide6.QtGui import QUndoCommand, QUndoStack
 
 
+_MISSING = object()
+
+
+def _same(left, right):
+    if left is _MISSING or right is _MISSING:
+        return left is right
+    # JSON 联合类型中的 7 / 7.0 / true 必须保持区别；不能用 Python 的数值宽松相等。
+    return json.dumps(left, sort_keys=True, ensure_ascii=False) == json.dumps(right, sort_keys=True, ensure_ascii=False)
+
+
+def _read(document, path):
+    node = document
+    for key in path:
+        if isinstance(node, dict) and key not in node:
+            return _MISSING
+        node = node[key]
+    return node
+
+
+def _write(document, path, value):
+    node = document
+    for key in path[:-1]:
+        if isinstance(node, dict) and key not in node:
+            node[key] = {}
+        node = node[key]
+    if value is _MISSING:
+        if isinstance(node, dict):
+            node.pop(path[-1], None)
+        else:
+            del node[path[-1]]
+    else:
+        node[path[-1]] = deepcopy(value)
+
+
+def _clear_input(document, cleanup):
+    if cleanup is not None:
+        prefix, subtree = cleanup
+        for key in list(document["pending_inputs"]):
+            if key == prefix or subtree and key.startswith(prefix + "."):
+                del document["pending_inputs"][key]
+
+
 def write_document(path: Path, payload: bytes) -> None:
     """同步及异步保存共用 Qt 原子替换，不启用非原子 fallback。"""
     file = QSaveFile(str(path))
@@ -36,17 +78,26 @@ class _SaveThread(QThread):
 
 
 class _Edit(QUndoCommand):
-    def __init__(self, draft, before, after, text):
+    def __init__(self, draft, path, before, after, text, cleanup):
         super().__init__(text)
         self.draft = draft
-        self.before = before
-        self.after = after
+        self.path = path
+        self.before = before if before is _MISSING else deepcopy(before)
+        self.after = after if after is _MISSING else deepcopy(after)
+        self.cleanup = cleanup
+
+    def _apply(self, value):
+        document = self.draft.document
+        _write(document, self.path, value)
+        # 暂存输入不属于语义历史；undo/redo 均不能复活已提交的旧文本。
+        _clear_input(document, self.cleanup)
+        self.draft._apply(document)
 
     def undo(self):
-        self.draft._apply(self.before)
+        self._apply(self.before)
 
     def redo(self):
-        self.draft._apply(self.after)
+        self._apply(self.after)
 
 
 class ExperimentDraft(QObject):
@@ -86,7 +137,7 @@ class ExperimentDraft(QObject):
 
     @property
     def dirty(self) -> bool:
-        return self._document != self._saved_document
+        return not _same(self._document, self._saved_document)
 
     @property
     def saving(self) -> bool:
@@ -103,37 +154,62 @@ class ExperimentDraft(QObject):
         self.changed.emit(self.revision)
         self.state_changed.emit()
 
-    def _edit(self, after, text):
-        if after != self._document:
-            self.undo_stack.push(_Edit(self, self.document, after, text))
+    def _edit_root(self, path):
+        node = self._document
+        for index, key in enumerate(path):
+            # 数组仍整体替换；新建父节点也一起记录，撤销后不残留空字典。
+            if isinstance(node, list):
+                return path[:index]
+            if key not in node:
+                return path[:index + 1]
+            node = node[key]
+        return path
+
+    def _edit(self, after, path, text, cleanup=None):
+        if _same(after, self._document):
+            return
+        root = self._edit_root(path)
+        before_value, after_value = _read(self._document, root), _read(after, root)
+        if _same(before_value, after_value):
+            # 数值没变而仅完成暂存：推进 revision，但不产生空的语义 undo。
+            self._apply(after)
+        else:
+            self.undo_stack.push(_Edit(self, root, before_value, after_value, text, cleanup))
 
     def set_value(self, path: tuple[str | int, ...], value: object) -> None:
         after = self.document
-        node = after
-        for key in path[:-1]:
-            if isinstance(node, dict) and key not in node:
-                node[key] = {}
-            node = node[key]
-        node[path[-1]] = deepcopy(value)
-        self._edit(after, "修改 " + ".".join(map(str, path)))
+        _write(after, path, value)
+        self._edit(after, path, "修改 " + ".".join(map(str, path)))
 
-    def remove_override(self, path: tuple[str | int, ...]) -> None:
+    def remove_override(self, path: tuple[str | int, ...], *, pending_prefix: str | None = None) -> None:
         after = self.document
-        node = after
-        for key in path[:-1]:
-            if isinstance(node, dict) and key not in node:
-                return
-            node = node[key]
-        if isinstance(node, dict) and path[-1] not in node:
-            return
-        del node[path[-1]]
-        self._edit(after, "删除覆盖 " + ".".join(map(str, path)))
+        if _read(after, path) is not _MISSING:
+            _write(after, path, _MISSING)
+        cleanup = (pending_prefix, True) if pending_prefix is not None else None
+        _clear_input(after, cleanup)
+        self._edit(after, path, "删除覆盖 " + ".".join(map(str, path)), cleanup)
 
     def set_pending(self, path: str, text: str | None) -> None:
         if text is None:
             self.remove_override(("pending_inputs", path))
         else:
             self.set_value(("pending_inputs", path), text)
+
+    def stage_input(self, pending_path: str, text: str | None) -> None:
+        """G3 原始文本暂存：同一 document 内实时持久化/失效旧检查，不逐字入 undo。"""
+        document = self.document
+        _write(document, ("pending_inputs", pending_path), _MISSING if text is None else text)
+        if not _same(document, self._document):
+            self._apply(document)
+
+    def commit_input(self, path: tuple[str | int, ...], value: object, *, pending_path: str,
+                     pending_subtree: bool = False) -> None:
+        """G3 一次字段提交；数组路径与原始输入路径可不同，但只清来源输入。"""
+        document = self.document
+        _write(document, path, value)
+        cleanup = (pending_path, pending_subtree)
+        _clear_input(document, cleanup)
+        self._edit(document, path, "提交输入 " + pending_path, cleanup)
 
     def mark_validated(self, revision: int, report: dict) -> None:
         if revision == self.revision:
