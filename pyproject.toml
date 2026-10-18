@@ -11,3 +11,6 @@ requires-python = ">=3.13,<3.14"
 where = ["src"]
 include = ["muse_gui", "muse_gui.*"]
 namespaces = false
+
+[tool.setuptools.package-data]
+muse_gui = ["assets/Icon/AppIcon.png"]
