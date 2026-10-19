@@ -40,9 +40,9 @@ class RunController(QObject):
                     and not state.submitting_command and not state.command_sync_required
                     and state.command_status != "pending")
 
-    @property
-    def can_set_display(self):
-        return self._worker_available() and not self.state.display_pending and self.state.definition is not None
+    def can_set_display(self, viewer: str) -> bool:
+        return (self._worker_available() and not self.state.display_pending[viewer]
+                and self.state.definition is not None)
 
     def open(self, run_id: str, *, new_run: bool = False) -> None:
         if self.state is not None:
@@ -79,14 +79,16 @@ class RunController(QObject):
         if self.state.record is not None:
             self._request("display", "GET", self._path("/display"))
 
-    def set_display(self, patch: dict) -> None:
-        if not self._worker_available() or self._has_pending("display_patch"):
+    def set_display(self, viewer: str, patch: dict) -> None:
+        operation = "display_patch:" + viewer
+        if not self._worker_available() or self._has_pending(operation):
             return
-        self.state.invalidate_entities("显示请求在途；等待当前选择的新帧")
-        self.state.display_pending = True
-        self._pending = {token: value for token, value in self._pending.items()
-                         if value[1:3] != (self._epoch, "entities_get")}
-        self._request("display_patch", "PATCH", self._path("/display"), json=patch)
+        if viewer == "viser":
+            self.state.invalidate_entities("Viser 显示请求在途；等待当前选择的新帧")
+            self._pending = {token: value for token, value in self._pending.items()
+                             if value[1:3] != (self._epoch, "entities_get")}
+        self.state.display_pending[viewer] = True
+        self._request(operation, "PATCH", self._path("/display"), json={viewer: patch})
         self.changed.emit()
 
     def command(self, command: str, world_id: int | None = None) -> None:
@@ -174,7 +176,7 @@ class RunController(QObject):
         state = self.state
         if not self.active or not self._view_visible or not state.connected or state.terminal:
             return
-        display = state.display
+        display = state.display["viser"] if state.display is not None else None
         if display is None or not display["effective"]["enabled"] or not display["viewer_url"]:
             self._release_view()
             return
@@ -221,8 +223,8 @@ class RunController(QObject):
                 return
         state = self.state
         if not result["ok"]:
-            if operation == "display_patch":
-                state.display_pending = False
+            if operation.startswith("display_patch:"):
+                state.display_pending[operation.split(":")[1]] = False
             if operation == "command":
                 state.submitting_command = False
                 state.command_sync_required = True
@@ -259,25 +261,26 @@ class RunController(QObject):
                 self._request("display", "GET", self._path("/display"))
             elif data["kind"] == "checkpoint":
                 self._request("artifacts", "GET", self._path("/artifacts"))
-        elif operation in {"display", "display_patch"}:
-            was_pending = state.display_pending
-            if operation == "display_patch":
-                state.display_pending = False
+        elif operation == "display" or operation.startswith("display_patch:"):
+            was_pending = state.display_pending["viser"]
+            if operation.startswith("display_patch:"):
+                state.display_pending[operation.split(":")[1]] = False
             previous = state.display
             state.apply_display(data)
-            changed = previous is None or any(previous[key] != state.display[key]
+            changed = previous is None or any(previous["viser"][key] != state.display["viser"][key]
                                               for key in ("selection_seq", "effective_seq"))
-            if changed or (was_pending and not state.display_pending):
+            if changed or (was_pending and not state.display_pending["viser"]):
                 # WS 新帧可能先于 display ACK 到达并被拒；暂停时不会再推送相同快照。
                 # 旧 GET 也不能复用：它可能返回旧选择的 unavailable，清掉当前实体。
                 self._pending = {token: value for token, value in self._pending.items()
                                  if value[1:3] != (self._epoch, "entities_get")}
-                if not state.display_pending:
+                if not state.display_pending["viser"]:
                     self._request("entities_get", "GET", self._path("/entities"))
             if previous is None:
                 if not state.terminal:
                     self._subscribe("entities", f"/streams/runs/{quote(state.run_id, safe='')}/entities")
-            self._sync_view()
+            if operation != "display_patch:native" or changed:
+                self._sync_view()
         elif operation in {"entities", "entities_get"}:
             state.apply_entities(data)
             if (operation == "entities" and data["available"] and state.entities["available"]
@@ -308,7 +311,7 @@ class RunController(QObject):
             setattr(state, operation, deepcopy(data))
         if self._new_run and self._worker_available() and state.display is not None:
             self._new_run = False
-            self.set_display({"enabled": True})
+            self.set_display("viser", {"enabled": True})
         if state.terminal:
             if not self._terminal_seen:
                 self._terminal_seen = True
@@ -343,7 +346,7 @@ class RunController(QObject):
             # G1 会先发断连状态，再发当前 generation 的 POST 错误；不能丢掉该错误。
             self._pending = {token: value for token, value in self._pending.items()
                              if value[0] == connection_state["generation"] == self.state.generation
-                             and value[2] in {"command", "cancel", "display_patch"}}
+                              and value[2] in {"command", "cancel", "display_patch:viser", "display_patch:native"}}
             self.changed.emit()
 
     def _page_ready(self, url, view_id):

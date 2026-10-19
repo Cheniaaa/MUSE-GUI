@@ -68,16 +68,20 @@ def record(run="r", mode="INTERACTIVE", state="RUNNING", interaction=None):
             "max_decision_steps": 100, "interaction": interaction or {"command": None, "result": None}}
 
 
-def display(world=1, seq=3, *, enabled=True, effective_seq=None, url="http://viewer:1234"):
+def display(world=1, seq=3, *, enabled=True, effective_seq=None, url="http://viewer:1234", native=None):
     settings = {"enabled": enabled, "world_id": world, "rate_hz": 17.}
-    return {"requested": settings.copy(), "effective": settings.copy(), "selection_seq": seq,
+    viser = {"requested": settings.copy(), "effective": settings.copy(), "selection_seq": seq,
             "effective_seq": seq if effective_seq is None else effective_seq, "status": "ready",
-            "viewer_url": url if enabled else None, "error": None, "frame": None,
-            "interaction": {"command": None, "result": None}}
+            "viewer_url": url if enabled else None, "error": None, "frame": None}
+    closed = {"enabled": False, "world_id": 0, "rate_hz": 10.}
+    return {"viser": viser, "native": native or {
+        "requested": closed.copy(), "effective": closed.copy(), "selection_seq": 0,
+        "effective_seq": 0, "status": "ready", "error": None, "frame": None},
+        "interaction": {"command": None, "result": None}}
 
 
-def frame(world=1, seq=3, episode=2, decision=9):
-    return {"run_id": "r", "world_id": world, "selection_seq": seq, "episode": episode,
+def frame(world=1, seq=3, episode=2, decision=9, *, viewer="viser"):
+    return {"viewer": viewer, "run_id": "r", "world_id": world, "selection_seq": seq, "episode": episode,
             "decision": decision, "tick": decision * 20, "sim_time": decision * .04,
             "scene_hash": "a" * 64, "nbody": 3}
 
@@ -89,6 +93,132 @@ def entities(identity=None, available=True):
         obj["pose"] = {"position": [1., 2., 3.], "orientation_matrix": [1., 0., 0., 0., 1., 0., 0., 0., 1.]}
     return {"objects": [obj], "frame": identity or frame(), "available": available,
             "reason": None if available else "No live preview"}
+
+
+def native_slot(world=0, seq=2, *, enabled=True, effective_seq=None):
+    slot = display(world, seq, enabled=enabled, effective_seq=effective_seq)["viser"]
+    del slot["viewer_url"]
+    slot["frame"] = frame(world, seq, viewer="native") if enabled else None
+    return slot
+
+
+def test_display_response_merges_each_viewer_independently(running):
+    connection, host, controller, _ = running
+    connection.answer("/runs/r/display/clients", {"view_id": "private"}, method="POST")
+    controller.refresh()
+    connection.answer("/runs/r/display", display(seq=5, native=native_slot(seq=2)))
+    current = entities(frame(seq=5))
+    connection.push("/entities", current)
+    connection.push("/view?", {"kind": "selection", "view_id": "private", "object_id": "scout_0",
+                                "frame": frame(seq=5)})
+    before_entities, before_selection = deepcopy(controller.state.entities), deepcopy(controller.state.selection_frame)
+    controller.refresh()
+    connection.answer("/runs/r/display", display(seq=4, native=native_slot(world=2, seq=3)))
+    assert controller.state.display["viser"]["effective_seq"] == 5
+    assert controller.state.display["native"]["effective_seq"] == 3
+    assert controller.state.entities == before_entities
+    assert controller.state.selection_frame == before_selection
+    assert host.unloaded == 0 and controller.view_id == "private"
+    controller.set_display("native", {"rate_hz": 7.})
+    connection.answer("/runs/r/display", display(seq=4, native=native_slot(world=2, seq=3, effective_seq=2)), method="PATCH")
+    assert controller.state.display["native"]["effective_seq"] == 3
+    assert controller.state.entities == before_entities
+    assert not controller._has_pending("entities_get")
+
+
+def test_native_patch_and_failure_leave_viser_connected(running):
+    connection, host, controller, view = running
+    connection.answer("/runs/r/display/clients", {"view_id": "private"}, method="POST")
+    before_entities = deepcopy(controller.state.entities)
+    view.native_enabled_check.setChecked(True)
+    view.native_world_spin.setValue(2)
+    view.native_rate_spin.setValue(7.)
+    QTest.mouseClick(view.native_apply_button, Qt.MouseButton.LeftButton)
+    assert controller.state.entities == before_entities
+    assert controller.can_set_display("viser") and not controller.can_set_display("native")
+    assert not view.native_apply_button.isEnabled() and view.apply_display_button.isEnabled()
+    view.world_spin.setValue(3)
+    QTest.mouseClick(view.apply_display_button, Qt.MouseButton.LeftButton)
+    patches = [r for r in connection.requests if r[1] == "PATCH"]
+    assert [r[3]["json"] for r in patches] == [
+        {"native": {"enabled": True, "world_id": 2, "rate_hz": 7.}},
+        {"viser": {"enabled": True, "world_id": 3, "rate_hz": 17.}}]
+    connection.answer("/runs/r/display", {"kind": "http", "message": "Native rejected"}, method="PATCH", ok=False)
+    assert controller.state.display_pending == {"viser": True, "native": False}
+    assert view.native_apply_button.isEnabled() and not view.apply_display_button.isEnabled()
+    assert host.unloaded == 0 and controller.view_id == "private"
+    failed = native_slot(enabled=False, seq=3)
+    failed.update(status="error", error="GLFW initialization failed")
+    connection.answer("/runs/r/display", display(world=3, seq=4, native=failed), method="PATCH")
+    assert "GLFW initialization failed" in view.native_status.text()
+    assert host.unloaded == 0 and controller.state.viewer_error is None
+
+
+def test_native_only_does_not_register_web_view(qapp):
+    connection, host = OrderedConnection(), Host()
+    controller = RunController(connection, host)
+    view = RunView(controller)
+    try:
+        controller.open("r")
+        connection.answer("/runs/r", record())
+        connection.answer("/experiments/e", {"topology": {"world_count": 4}})
+        connection.answer("/runs/r/display", display(enabled=False, native=native_slot(world=2)))
+        assert not any(r[2].endswith("/display/clients") for r in connection.requests)
+        assert not host.opened and not controller.state.pairing
+        assert view.native_enabled_check.isChecked() and not view.enabled_check.isChecked()
+        assert view.native_world_spin.value() == 2
+        assert view.native_world_spin.maximum() == 3
+        assert view.native_rate_spin.minimum() == 1. and view.native_rate_spin.maximum() == 30.
+        controller.close_tab("r")
+        assert not any(r[1] == "PATCH" for r in connection.requests)
+    finally:
+        controller.close_tab("r")
+        view.close()
+
+
+def test_native_patch_does_not_retry_viser_registration(running):
+    connection, host, controller, _ = running
+    connection.answer("/runs/r/display/clients", {"kind": "http", "message": "pairing failed"}, method="POST", ok=False)
+    controller.set_display("native", {"enabled": True})
+    connection.answer("/runs/r/display", display(native=native_slot()), method="PATCH")
+    assert not any(r[1:3] == ("POST", "/runs/r/display/clients") for r in connection.requests)
+    assert not host.opened and controller.state.viewer_error is not None
+
+
+def test_reopen_reads_both_viewers_without_patching(running):
+    connection, _, controller, view = running
+    controller.close_tab("r")
+    controller.open("r")
+    connection.answer("/runs/r", record())
+    connection.answer("/experiments/e", {"topology": {"world_count": 4}})
+    connection.answer("/runs/r/display", display(world=0, seq=6, native=native_slot(world=3, seq=7)))
+    assert view.world_spin.value() == 0 and view.native_world_spin.value() == 3
+    assert view.enabled_check.isChecked() and view.native_enabled_check.isChecked()
+    assert not any(r[1] == "PATCH" for r in connection.requests)
+
+
+def test_native_frame_cannot_supply_viser_entities_or_selection(running):
+    connection, _, controller, _ = running
+    connection.answer("/runs/r/display/clients", {"view_id": "private"}, method="POST")
+    before = deepcopy(controller.state.entities)
+    connection.push("/entities", entities(frame(episode=99, viewer="native")))
+    connection.push("/view?", {"kind": "selection", "view_id": "private", "object_id": "scout_0",
+                                "frame": frame(viewer="native")})
+    assert controller.state.entities == before and controller.state.selection_frame is None
+
+
+def test_disconnect_preserves_both_display_patch_result_routes(running):
+    connection, _, controller, _ = running
+    controller.set_display("native", {"enabled": True})
+    controller.set_display("viser", {"world_id": 2})
+    connection.state["state"] = "disconnected"
+    connection.state_changed.emit(connection.state.copy())
+    connection.answer("/runs/r/display", {"kind": "connection", "outcome": "unknown", "message": "lost"}, method="PATCH", ok=False)
+    assert controller.state.display_pending == {"viser": True, "native": False}
+    connection.answer("/runs/r/display", display(2, 4), method="PATCH")
+    assert controller.state.display_pending == {"viser": False, "native": False}
+    assert controller.state.display["viser"]["effective_seq"] == 4
+    assert not any(r[1] == "PATCH" for r in connection.requests)
 
 
 def open_run(connection, controller, *, mode="INTERACTIVE", phase="RUNNING", new=False):
@@ -182,8 +312,8 @@ def test_reopen_uses_effective_display_and_private_intents(running):
     view.world_spin.setValue(3)
     view.rate_spin.setValue(29.)
     open_run(connection, controller)
-    assert controller.state.display["effective"]["world_id"] == 1
-    assert controller.state.display["effective"]["rate_hz"] == 17.
+    assert controller.state.display["viser"]["effective"]["world_id"] == 1
+    assert controller.state.display["viser"]["effective"]["rate_hz"] == 17.
     assert view.world_spin.value() == 1 and view.rate_spin.value() == 17.
     assert not any(r[1] == "PATCH" for r in connection.requests)
 
@@ -196,7 +326,7 @@ def test_new_run_enables_only_after_worker_stage_without_overriding_world_rate(q
         assert not any(r[1] == "PATCH" for r in connection.requests)
         connection.push("/events", {"run_id": "r", "event_seq": 3, "kind": "preparing", "payload": {}})
         patches = [r for r in connection.requests if r[1] == "PATCH"]
-        assert len(patches) == 1 and patches[0][3]["json"] == {"enabled": True}
+        assert len(patches) == 1 and patches[0][3]["json"] == {"viser": {"enabled": True}}
         connection.push("/events", {"run_id": "r", "event_seq": 4, "kind": "compiling", "payload": {}})
         assert len([r for r in connection.requests if r[1] == "PATCH"]) == 1
     finally:
@@ -215,7 +345,7 @@ def test_frame_identity_and_readonly_modes(qapp, mode):
         assert view.object_details.isReadOnly()
         controller.command("pause")
         assert not any(r[2].endswith("/commands") for r in connection.requests)
-        controller.set_display({"world_id": 2})
+        controller.set_display("viser", {"world_id": 2})
         assert not controller.state.entities["available"]
         assert "position" not in view.object_details.toPlainText()
         changed = display(2, 4)
@@ -278,7 +408,7 @@ def test_cancel_does_not_invent_terminal_state(running):
 def test_display_inflight_and_old_http_read_cannot_restore_previous_world(running):
     connection, _, controller, view = running
     view.objects_table.selectRow(0)
-    controller.set_display({"world_id": 2})
+    controller.set_display("viser", {"world_id": 2})
     connection.push("/entities", entities(frame(world=1, seq=3, episode=99)))
     assert not controller.state.entities["available"]
     assert "position" not in view.object_details.toPlainText()
@@ -286,7 +416,7 @@ def test_display_inflight_and_old_http_read_cannot_restore_previous_world(runnin
     connection.push("/entities", entities(frame(world=2, seq=4)))
     controller.refresh()
     connection.answer("/runs/r/display", display(1, 3))
-    assert controller.state.display["requested"]["world_id"] == 2
+    assert controller.state.display["viser"]["requested"]["world_id"] == 2
     assert controller.state.entities["frame"]["world_id"] == 2
 
 
@@ -299,12 +429,13 @@ def test_paused_display_reconciles_entities_rejected_before_ack(qapp, arrival):
     paused = {"command": command, "result": {**command, "status": "applied", "paused": True,
                                               "steps": 0, "updates": 0}}
     initial = display(world=0, seq=1)
-    initial["requested"]["rate_hz"] = initial["effective"]["rate_hz"] = 10.
+    initial["viser"]["requested"]["rate_hz"] = initial["viser"]["effective"]["rate_hz"] = 10.
     initial["interaction"] = paused
     current = entities(frame(world=0, seq=2, episode=0, decision=0))
     applied = display(world=0, seq=2)
-    applied["requested"]["rate_hz"] = applied["effective"]["rate_hz"] = 7.
-    applied.update(frame=current["frame"], interaction=paused)
+    applied["viser"]["requested"]["rate_hz"] = applied["viser"]["effective"]["rate_hz"] = 7.
+    applied["viser"]["frame"] = current["frame"]
+    applied["interaction"] = paused
     try:
         controller.open("r")
         connection.answer("/runs/r", record(interaction=paused))
@@ -313,9 +444,9 @@ def test_paused_display_reconciles_entities_rejected_before_ack(qapp, arrival):
         connection.answer("/runs/r/entities", entities(frame(world=0, seq=1, episode=0, decision=0)))
         view.objects_table.selectRow(0)
         assert "position" in view.object_details.toPlainText()
-        controller.set_display({"enabled": True, "world_id": 0, "rate_hz": 7.})
+        controller.set_display("viser", {"enabled": True, "world_id": 0, "rate_hz": 7.})
         if arrival == "before_effective_ack":
-            connection.answer("/runs/r/display", {**applied, "effective_seq": 1}, method="PATCH")
+            connection.answer("/runs/r/display", {**applied, "viser": {**applied["viser"], "effective_seq": 1}}, method="PATCH")
         elif arrival == "poll_before_patch":
             controller.refresh()
             connection.answer("/runs/r/display", applied)
@@ -328,7 +459,7 @@ def test_paused_display_reconciles_entities_rejected_before_ack(qapp, arrival):
             connection.answer("/runs/r/display", applied)
         else:
             # poll 可先读到 applied；随后 PATCH 的旧 pending 快照不能回退真值。
-            response = {**applied, "effective_seq": 1} if arrival == "poll_before_patch" else applied
+            response = {**applied, "viser": {**applied["viser"], "effective_seq": 1}} if arrival == "poll_before_patch" else applied
             connection.answer("/runs/r/display", response, method="PATCH")
         reads = [r for r in connection.requests if r[2] == "/runs/r/entities" and r[0] in controller._pending]
         assert len(reads) == 1, "display ACK 后须有一次新的实体真值读取"
@@ -339,7 +470,7 @@ def test_paused_display_reconciles_entities_rejected_before_ack(qapp, arrival):
                 connection.result_received.emit(1, old[0], {"ok": True,
                     "data": entities(current["frame"], available=False)})
         assert controller.state.entities == current
-        assert controller.state.display["effective_seq"] == 2
+        assert controller.state.display["viser"]["effective_seq"] == 2
         assert controller.state.paused is True and controller.state.interaction["result"]["steps"] == 0
         assert "position" in view.object_details.toPlainText()
         assert not any(r[1] == "POST" and r[2].endswith("/commands") for r in connection.requests)
@@ -356,10 +487,10 @@ def test_paused_display_reconciles_entities_rejected_before_ack(qapp, arrival):
 @pytest.mark.parametrize("old_result", ["available", "unavailable", "error"])
 def test_display_reconciliation_discards_superseded_entities_get(running, old_result):
     connection, _, controller, view = running
-    controller.set_display({"world_id": 2})
+    controller.set_display("viser", {"world_id": 2})
     connection.answer("/runs/r/display", display(2, 4), method="PATCH")
     old = next(r for r in connection.requests if r[2] == "/runs/r/entities")
-    controller.set_display({"world_id": 0})
+    controller.set_display("viser", {"world_id": 0})
     connection.answer("/runs/r/display", display(0, 5), method="PATCH")
     fresh = next(r for r in connection.requests if r[2] == "/runs/r/entities" and r[0] != old[0])
     current = entities(frame(world=0, seq=5, episode=0, decision=0))
@@ -377,7 +508,7 @@ def test_display_reconciliation_discards_superseded_entities_get(running, old_re
 @pytest.mark.parametrize("old_available", [True, False])
 def test_display_reconciliation_keeps_reset_and_entity_watermarks(running, old_available):
     connection, _, controller, _ = running
-    controller.set_display({"world_id": 2})
+    controller.set_display("viser", {"world_id": 2})
     connection.answer("/runs/r/display", display(2, 4), method="PATCH")
     connection.push("/entities", entities(frame(world=2, seq=4, episode=2, decision=9)))
     connection.push("/entities", entities(frame(world=2, seq=4, episode=3, decision=0)))
@@ -388,13 +519,15 @@ def test_display_reconciliation_keeps_reset_and_entity_watermarks(running, old_a
     connection.push("/entities", entities(frame(world=2, seq=4, episode=2, decision=100)))
     assert controller.state.entities == current
     controller.refresh()
-    connection.answer("/runs/r/display", {**display(2, 4), "frame": current["frame"]})
+    snapshot = display(2, 4)
+    snapshot["viser"]["frame"] = current["frame"]
+    connection.answer("/runs/r/display", snapshot)
     assert not controller._has_pending("entities_get")
 
 
 def test_display_reconciliation_unavailable_read_does_not_retry(running):
     connection, _, controller, _ = running
-    controller.set_display({"world_id": 2})
+    controller.set_display("viser", {"world_id": 2})
     applied = display(2, 4)
     connection.answer("/runs/r/display", applied, method="PATCH")
     connection.answer("/runs/r/entities", {"objects": [], "frame": None, "available": False,
@@ -434,7 +567,9 @@ def test_selection_can_lag_entity_frame_without_mixing_headers_or_weakening_pose
     connection.answer("/runs/r/display/clients", {"view_id": "private", "connected": False}, method="POST")
     connection.push("/entities", entities(frame(decision=11)))
     controller.refresh()
-    connection.answer("/runs/r/display", {**display(), "frame": frame(decision=11)})
+    snapshot = display()
+    snapshot["viser"]["frame"] = frame(decision=11)
+    connection.answer("/runs/r/display", snapshot)
     connection.push("/view?", {"kind": "selection", "view_id": "private", "object_id": "scout_0",
                                 "frame": frame(decision=10)})
     assert controller.state.selected_object == "scout_0"
@@ -491,7 +626,9 @@ def test_unavailable_transition_keeps_reset_frame_watermark(running):
 def test_display_frame_watermark_rejects_late_pre_reset_entities(running):
     connection, _, controller, _ = running
     controller.refresh()
-    connection.answer("/runs/r/display", {**display(), "frame": frame(episode=3, decision=1)})
+    snapshot = display()
+    snapshot["viser"]["frame"] = frame(episode=3, decision=1)
+    connection.answer("/runs/r/display", snapshot)
     connection.push("/entities", entities(frame(episode=2, decision=99)))
     assert not controller.state.entities["available"]
 
@@ -535,11 +672,11 @@ def test_remote_selection_clear_clears_real_qt_table_selection(running):
 
 def test_late_patch_response_cannot_roll_back_applied_display_sequence(running):
     connection, _, controller, _ = running
-    controller.set_display({"world_id": 2})
+    controller.set_display("viser", {"world_id": 2})
     controller.refresh()
     connection.answer("/runs/r/display", display(2, 4))
     connection.answer("/runs/r/display", display(2, 4, effective_seq=3), method="PATCH")
-    assert controller.state.display["effective_seq"] == 4
+    assert controller.state.display["viser"]["effective_seq"] == 4
 
 
 def test_g1_disconnect_before_post_error_keeps_unknown_outcome_visible(running):

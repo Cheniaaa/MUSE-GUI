@@ -16,7 +16,7 @@ class RunView(QWidget):
     def __init__(self, controller, parent=None):
         super().__init__(parent)
         self.controller = controller
-        self._settings_key = None
+        self._settings_key = {"viser": None, "native": None}
         self._artifact_ids = None
         layout = QVBoxLayout(self)
         self.run_status = BodyLabel("尚未打开 Run", self)
@@ -48,13 +48,13 @@ class RunView(QWidget):
         self.command_status.setWordWrap(True)
         layout.addWidget(self.command_status)
         display = QHBoxLayout()
-        self.enabled_check = CheckBox("启用共享运行显示", self)
+        self.enabled_check = CheckBox("启用 Viser 共享显示", self)
         self.world_spin = QSpinBox(self)
         self.rate_spin = QDoubleSpinBox(self)
         self.rate_spin.setRange(1., 30.)
         self.rate_spin.setSuffix(" Hz")
-        self.apply_display_button = PushButton("应用共享显示", self)
-        self.apply_display_button.clicked.connect(lambda: controller.set_display({
+        self.apply_display_button = PushButton("应用 Viser 显示", self)
+        self.apply_display_button.clicked.connect(lambda: controller.set_display("viser", {
             "enabled": self.enabled_check.isChecked(), "world_id": self.world_spin.value(),
             "rate_hz": self.rate_spin.value()}))
         for widget in (self.enabled_check, BodyLabel("world", self), self.world_spin,
@@ -63,9 +63,30 @@ class RunView(QWidget):
         layout.addLayout(display)
         self.display_status = BodyLabel("等待 Server 显示状态", self)
         self.display_status.setWordWrap(True)
+        layout.addWidget(self.display_status)
+        native = QHBoxLayout()
+        self.native_enabled_check = CheckBox("启用 Native 共享显示", self)
+        self.native_world_spin = QSpinBox(self)
+        self.native_rate_spin = QDoubleSpinBox(self)
+        self.native_rate_spin.setRange(1., 30.)
+        self.native_rate_spin.setSuffix(" Hz")
+        self.native_apply_button = PushButton("应用 Native 显示", self)
+        self.native_apply_button.clicked.connect(lambda: controller.set_display("native", {
+            "enabled": self.native_enabled_check.isChecked(), "world_id": self.native_world_spin.value(),
+            "rate_hz": self.native_rate_spin.value()}))
+        for widget in (self.native_enabled_check, BodyLabel("world", self), self.native_world_spin,
+                       self.native_rate_spin, self.native_apply_button):
+            native.addWidget(widget)
+        layout.addLayout(native)
+        self.native_status = BodyLabel("等待 Server Native 状态", self)
+        self.native_status.setWordWrap(True)
+        layout.addWidget(self.native_status)
+        native_note = BodyLabel("Native窗口位于Server主机；仅只读刚体几何，辅助层未提供", self)
+        native_note.setWordWrap(True)
+        layout.addWidget(native_note)
         self.viewer_status = BodyLabel("网页未加载", self)
         self.pairing_status = BodyLabel("选择同步未就绪", self)
-        for widget in (self.display_status, self.viewer_status, self.pairing_status):
+        for widget in (self.viewer_status, self.pairing_status):
             layout.addWidget(widget)
         row = QHBoxLayout()
         self.reconnect_button = PushButton("重连本视图（不改共享设置）", self)
@@ -84,6 +105,7 @@ class RunView(QWidget):
         self.objects_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.objects_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.objects_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        layout.addWidget(BodyLabel("Viser对象", self))
         self.objects_table.horizontalHeader().setStretchLastSection(True)
         self.objects_table.itemSelectionChanged.connect(self._selected)
         layout.addWidget(self.objects_table)
@@ -137,7 +159,9 @@ class RunView(QWidget):
         self.cancel_button.setEnabled(active and not state.terminal if ready else False)
         self.results_button.setEnabled(ready)
         for widget in (self.apply_display_button, self.enabled_check, self.world_spin, self.rate_spin):
-            widget.setEnabled(self.controller.can_set_display)
+            widget.setEnabled(self.controller.can_set_display("viser"))
+        for widget in (self.native_apply_button, self.native_enabled_check, self.native_world_spin, self.native_rate_spin):
+            widget.setEnabled(self.controller.can_set_display("native"))
         self.reconnect_button.setEnabled(bool(active and not state.terminal))
         paired = bool(active and state.pairing.get("paired") and state.pairing.get("connected") and not state.terminal)
         for widget in (self.focus_button, self.visible_check, self.camera_button):
@@ -147,6 +171,7 @@ class RunView(QWidget):
             self.command_status.setText("命令：none；暂停状态未知")
             self.connection_status.setText("正在读取；不沿用上一 Run 的真值")
             self.display_status.setText("等待 Server 显示状态")
+            self.native_status.setText("等待 Server Native 状态")
             self.viewer_status.setText("网页未加载")
             self.pairing_status.setText("选择同步未就绪")
             self.frame_status.setText("实体无实时帧")
@@ -163,26 +188,31 @@ class RunView(QWidget):
         result = state.interaction["result"]
         self.command_status.setText(f"命令：{state.command_status}；paused={state.paused}；"
                                    f"{json.dumps(result, ensure_ascii=False) if result else '等待实际 command_result'}")
-        display = state.display
-        if display is not None:
+        if state.display is not None:
             count = state.definition["topology"]["world_count"] if state.definition else None
-            key = (state, display["selection_seq"], count)
-            if key != self._settings_key and count is not None:
-                self._settings_key = key
-                self.world_spin.setMaximum(count - 1)
+            if count is not None:
                 self.reset_world_spin.setMaximum(count - 1)
-                self.world_spin.setValue(display["requested"]["world_id"])
-                self.reset_world_spin.setValue(display["effective"]["world_id"])
-                self.rate_spin.setValue(display["requested"]["rate_hz"])
-                self.enabled_check.setChecked(display["requested"]["enabled"])
-            self.display_status.setText(f"requested={display['requested']} (seq {display['selection_seq']})\n"
-                                        f"effective={display['effective']} (seq {display['effective_seq']}) · "
-                                        f"{display['status']} · {'GUI请求在途' if state.display_pending else ''} · {display['error'] or ''}")
+            for viewer, enabled, world, rate, status in (
+                    ("viser", self.enabled_check, self.world_spin, self.rate_spin, self.display_status),
+                    ("native", self.native_enabled_check, self.native_world_spin, self.native_rate_spin, self.native_status)):
+                display = state.display[viewer]
+                key = (state, display["selection_seq"], count)
+                if key != self._settings_key[viewer] and count is not None:
+                    self._settings_key[viewer] = key
+                    world.setMaximum(count - 1)
+                    world.setValue(display["requested"]["world_id"])
+                    rate.setValue(display["requested"]["rate_hz"])
+                    enabled.setChecked(display["requested"]["enabled"])
+                    if viewer == "viser":
+                        self.reset_world_spin.setValue(display["effective"]["world_id"])
+                status.setText(f"{viewer}: requested={display['requested']} (seq {display['selection_seq']})\n"
+                               f"effective={display['effective']} (seq {display['effective_seq']}) · "
+                               f"{display['status']} · {'GUI请求在途' if state.display_pending[viewer] else ''} · {display['error'] or ''}")
         self.viewer_status.setText(state.viewer_error or ("网页已加载（配对另见下方）" if state.page_loaded else "网页未加载"))
         self.pairing_status.setText(f"选择同步：{state.pairing}" if paired else "选择同步未就绪")
         snapshot = state.entities
-        self.frame_status.setText(("实体当前帧：" + json.dumps(snapshot["frame"], ensure_ascii=False))
-                                  if snapshot["available"] else "实体不可实时：" + str(snapshot["reason"]))
+        self.frame_status.setText(("Viser实体当前帧：" + json.dumps(snapshot["frame"], ensure_ascii=False))
+                                  if snapshot["available"] else "Viser实体不可实时：" + str(snapshot["reason"]))
         with QSignalBlocker(self.objects_table):
             self.objects_table.clearSelection()
             self.objects_table.setRowCount(len(snapshot["objects"]))

@@ -19,7 +19,7 @@ class RunState:
         self.selection_frame = None
         self.connected = True
         self.submitting_command = False
-        self.display_pending = False
+        self.display_pending = {"viser": False, "native": False}
         self.command_sync_required = False
         self.error = None
         self.viewer_error = None
@@ -95,23 +95,26 @@ class RunState:
             self.record["metrics"] = deepcopy(payload)
 
     def apply_display(self, snapshot: dict) -> None:
-        if self.display is not None and (snapshot["selection_seq"], snapshot["effective_seq"]) < (
-                self.display["selection_seq"], self.display["effective_seq"]):
-            return
-        previous = self.display
-        self.display = deepcopy(snapshot)
-        frame, entity_frame = snapshot["frame"], self.entities["frame"]
-        new_episode = (frame is not None and entity_frame is not None
-                       and frame["selection_seq"] == entity_frame["selection_seq"]
-                       and frame["world_id"] == entity_frame["world_id"]
-                       and frame["episode"] > entity_frame["episode"])
-        if (previous is None or previous["selection_seq"] != snapshot["selection_seq"]
-                or new_episode
-                or not snapshot["requested"]["enabled"]
-                or snapshot["selection_seq"] != snapshot["effective_seq"]):
-            self.invalidate_entities("显示选择变更；等待当前 world/selection 的新帧")
-        if "interaction" in snapshot:
-            self.apply_interaction(snapshot["interaction"])
+        merged = self.display.copy() if self.display is not None else {}
+        for viewer in ("viser", "native"):
+            incoming, previous = snapshot[viewer], merged.get(viewer)
+            if previous is not None and (incoming["selection_seq"], incoming["effective_seq"]) < (
+                    previous["selection_seq"], previous["effective_seq"]):
+                continue
+            merged[viewer] = deepcopy(incoming)
+            if viewer == "viser":
+                frame, entity_frame = incoming["frame"], self.entities["frame"]
+                new_episode = (frame is not None and entity_frame is not None
+                               and frame["selection_seq"] == entity_frame["selection_seq"]
+                               and frame["world_id"] == entity_frame["world_id"]
+                               and frame["episode"] > entity_frame["episode"])
+                if (previous is None or previous["selection_seq"] != incoming["selection_seq"]
+                        or new_episode or not incoming["requested"]["enabled"]
+                        or incoming["selection_seq"] != incoming["effective_seq"]):
+                    self.invalidate_entities("Viser 显示选择变更；等待当前 world/selection 的新帧")
+        self.apply_interaction(snapshot["interaction"])
+        merged["interaction"] = deepcopy(self.interaction)
+        self.display = merged
 
     def invalidate_entities(self, reason: str) -> None:
         self.entities = {"objects": [{key: value for key, value in obj.items() if key != "pose"}
@@ -120,9 +123,10 @@ class RunState:
         self.selection_frame = None
 
     def accepts_frame(self, frame: dict | None, *, for_selection: bool = False) -> bool:
-        if self.display_pending or frame is None or self.display is None or frame["run_id"] != self.run_id:
+        if (self.display_pending["viser"] or frame is None or self.display is None
+                or frame["viewer"] != "viser" or frame["run_id"] != self.run_id):
             return False
-        display = self.display
+        display = self.display["viser"]
         if (frame["selection_seq"] != display["selection_seq"]
                 or frame["selection_seq"] != display["effective_seq"]
                 or frame["world_id"] != display["requested"]["world_id"]
@@ -149,7 +153,8 @@ class RunState:
     def apply_entities(self, snapshot: dict) -> None:
         if snapshot["available"]:
             if (not self.connected or self.terminal or not self.accepts_frame(snapshot["frame"])
-                    or not self.display["requested"]["enabled"] or not self.display["effective"]["enabled"]):
+                    or not self.display["viser"]["requested"]["enabled"]
+                    or not self.display["viser"]["effective"]["enabled"]):
                 return
             self._scene_hash = snapshot["frame"]["scene_hash"]
             self._latest_frame = deepcopy(snapshot["frame"])

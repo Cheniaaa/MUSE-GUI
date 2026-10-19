@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from test_run_view import display, record
+from test_run_view import display, native_slot, record
 from test_workbench_integration import integrated
 from test_viewer_host import webpage
 
@@ -43,6 +43,11 @@ def test_current_run_reconnects_only_to_its_catalog(integrated, transport, catal
     if catalog == 'catalog-a':
         assert any(item[1:3] == ('GET', '/runs/r') for item in requests)
         answer('/runs/r', record())
+        answer('/runs/r/display', display(enabled=False, native=native_slot(world=2, seq=7)))
+        assert controller.run.state.display['native']['effective']['world_id'] == 2
+        assert not controller.run.state.display['viser']['effective']['enabled']
+        assert controller.run_viewer.page is None
+        assert not any(item[1:3] == ('POST', '/runs/r/display/clients') for item in requests)
         assert controller.run.can_command
         assert '/streams/runs/r/events' in subscriptions.values()
     else:
