@@ -81,9 +81,11 @@ def display(world=1, seq=3, *, enabled=True, effective_seq=None, url="http://vie
 
 
 def frame(world=1, seq=3, episode=2, decision=9, *, viewer="viser"):
+    # Native 使用当前 CF2 模型的状态布局；Viser 保留原三刚体 pose 样本。
     return {"viewer": viewer, "run_id": "r", "world_id": world, "selection_seq": seq, "episode": episode,
             "decision": decision, "tick": decision * 20, "sim_time": decision * .04,
-            "scene_hash": "a" * 64, "nbody": 3}
+            "scene_hash": "a" * 64, "nbody": 4 if viewer == "native" else 3,
+            "payload_floats": 123 if viewer == "native" else 36}
 
 
 def entities(identity=None, available=True):

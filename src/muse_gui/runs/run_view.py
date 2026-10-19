@@ -81,7 +81,11 @@ class RunView(QWidget):
         self.native_status = BodyLabel("等待 Server Native 状态", self)
         self.native_status.setWordWrap(True)
         layout.addWidget(self.native_status)
-        native_note = BodyLabel("Native窗口位于Server主机；仅只读刚体几何，辅助层未提供", self)
+        native_note = BodyLabel(
+            "Native 为 Server 主机上的官方 MuJoCo 界面；训练状态隔离，原生写操作不控制 Run，"
+            "物理参数/状态按快照恢复。状态已同步不等于屏幕已呈现。\n"
+            "状态/原生 Sensor 来自 Worker；接触等派生诊断为 CPU 重建；"
+            "Profiler 为显示端统计，不代表 Worker 性能或训练吞吐。", self)
         native_note.setWordWrap(True)
         layout.addWidget(native_note)
         self.viewer_status = BodyLabel("网页未加载", self)
