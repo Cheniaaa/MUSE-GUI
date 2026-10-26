@@ -31,7 +31,7 @@ class Connection(QObject):
     state_changed = Signal(dict)
     def __init__(self):
         super().__init__()
-        self.state = {'state': 'connected', 'generation': 1}
+        self.state = {'state': 'connected', 'generation': 1, 'catalog_id': None}
         self.requests, self.intents, self.streams = [], [], []
 
     def request(self, token, method, path, **kwargs):
@@ -265,9 +265,9 @@ def test_preview_restore_ignores_late_manifest_from_old_context(empty_scene, inv
         controller.refresh_preview()
         base = {**BASE, 'resource_id': 'new-env'}
     else:
-        connection.state = {'state': 'disconnected', 'generation': 2}
+        connection.state = {'state': 'disconnected', 'generation': 2, 'catalog_id': None}
         connection.state_changed.emit(connection.state)
-        connection.state = {'state': 'connected', 'generation': 3}
+        connection.state = {'state': 'connected', 'generation': 3, 'catalog_id': None}
         connection.state_changed.emit(connection.state)
         base = BASE
     current_token = connection.requests[-1][0]

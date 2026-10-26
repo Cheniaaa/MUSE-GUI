@@ -1,6 +1,7 @@
 """草稿场景编辑与CPU预览；原生几何/拾取/编译只由Server拥有。"""
 from copy import deepcopy
 import json
+import math
 from urllib.parse import quote
 from uuid import uuid4
 
@@ -9,22 +10,36 @@ from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from muse_gui.experiments.schema_editor import at, path_text
 
 
-def _placement(request, group):
+def _pose_issue(pose):
+    """唯一草稿→几何边界：不补缺项、不把原始部分输入交给姿态消费者。"""
+    if not isinstance(pose, dict):
+        return 'pose 必须是包含 position / orientation_wxyz 的对象'
+    for field, length in (('position', 3), ('orientation_wxyz', 4)):
+        values = pose.get(field)
+        if (not isinstance(values, list) or len(values) != length
+                or any(type(value) not in (int, float) or not math.isfinite(value) for value in values)):
+            return f'{field} 需要 {length} 个有限数'
+    if not math.isclose(sum(value * value for value in pose['orientation_wxyz']), 1., abs_tol=1e-6):
+        return 'orientation_wxyz 必须是单位四元数'
+    return None
+
+
+def _placement(request, group, groups):
     """选中组修改共享placement时拆开引用，不能移动未选中的组。"""
     scenario = request['scenario']
     identity = group['placement_id']
     placements = scenario.setdefault('placements', {})
-    if any(other is not group and other.get('placement_id') == identity for other in scenario['entity_groups']):
+    if any(other is not group and other.get('placement_id') == identity for other in groups.values()):
         new = 'placement-' + uuid4().hex
         placements[new] = deepcopy(placements.get(identity, []))
         group['placement_id'] = identity = new
     return placements.setdefault(identity, [])
 
 
-def _remove_slot(request, group_id, slot):
+def _remove_slot(request, group_id, slot, groups):
     scenario = request['scenario']
-    group = next(group for group in scenario['entity_groups'] if group['group_id'] == group_id)
-    placements = _placement(request, group)
+    group = groups[group_id]
+    placements = _placement(request, group, groups)
     if slot < len(placements):
         placements.pop(slot)
     group['count'] -= 1
@@ -101,6 +116,8 @@ class SceneController(QObject):
         self.stale = True
         self.selected = None
         self.objects = {}
+        self._group_indices = {}
+        self._preview_edit = None
         self._manifest = None
         self._manifest_key = None
         self._draft_id = draft.document['draft_id']
@@ -146,14 +163,19 @@ class SceneController(QObject):
         self._changed()
 
     def _request(self, operation, method, path, **kwargs):
+        catalog_id = self.draft.document['catalog_id']
+        if operation in ('manifest', 'create', 'update') and catalog_id not in (None, self.connection.state['catalog_id']):
+            self._fail(f'预览请求已拒绝：草稿来自 Catalog {catalog_id}；请连接原 Catalog 或显式重选资源。')
+            return False
         token = self._prefix + uuid4().hex
         self._requests[token] = (operation, self.connection.state['generation'], self._epoch,
                                  self.draft.document['draft_id'], self.draft.revision)
         self.connection.request(token, method, path, **kwargs)
+        return True
 
     def set_environment_manifest(self, manifest):
         self._manifest = deepcopy(manifest)
-        self._manifest_key = (manifest['base']['resource_id'], manifest['base']['revision'])
+        self._manifest_key = (self.draft.document['catalog_id'], manifest['base']['resource_id'], manifest['base']['revision'])
         self._render()
         self._schedule()
 
@@ -161,31 +183,105 @@ class SceneController(QObject):
         document = self.draft.document
         edit = document['environment_edit']
         upserts, removed = edit.get('upserts', {}), edit.get('removed', [])
-        objects = {}
+        issues, objects, preview_upserts = [], {}, {}
+        usable_edit = True
+        if not isinstance(upserts, dict):
+            issues.append('environment_edit.upserts 必须是对象；未应用此环境编辑')
+            upserts, usable_edit = {}, False
+        if not isinstance(removed, list) or any(not isinstance(identity, str) for identity in removed):
+            issues.append('environment_edit.removed 必须是对象ID列表；未应用此环境编辑')
+            removed, usable_edit = [], False
+        if edit and (not isinstance(edit.get('base'), dict)
+                     or self._manifest is not None and edit['base'] != self._manifest['base']):
+            issues.append('environment_edit.base 需要对应当前环境manifest；未应用此环境编辑')
+            usable_edit = False
+        preview_removed = list(removed)
         for item in self._manifest['objects'] if self._manifest else []:
             if item['object_id'] in removed:
                 continue
-            box = deepcopy(upserts.get(item['object_id'], item['box']))
+            box = deepcopy(item['box'])
             objects[item['object_id']] = {**item, 'box': box, 'pose': box['pose'] if box else None,
                                          'kind': 'environment'}
         for identity, box in upserts.items():
-            if identity not in objects:
-                objects[identity] = dict(label=box['label'], editable=True, reason=None,
+            issue = None
+            if not isinstance(box, dict):
+                issue = 'box 必须是对象'
+            elif not isinstance(box.get('label'), str):
+                issue = 'box.label 需要字符串'
+            elif any(type(box.get(field)) is not bool for field in ('collision', 'rf_blocking')):
+                issue = 'box.collision / rf_blocking 需要布尔值'
+            else:
+                sizes = box.get('size_m')
+                if (not isinstance(sizes, list) or len(sizes) != 3
+                        or any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0 for value in sizes)):
+                    issue = 'box.size_m 需要三个有限正数'
+                else:
+                    issue = _pose_issue(box.get('pose'))
+            if identity in removed:
+                issue = '对象不能同时更新和删除'
+            if issue:
+                original = objects.get(identity)
+                if original is not None and original['editable'] and identity not in preview_removed:
+                    preview_removed.append(identity)
+                objects[identity] = dict(label=identity, editable=False, reason=issue + '；不进入预览',
+                                         box=None, pose=None, kind='environment')
+                issues.append(f'environment_edit.upserts.{identity}: {issue}')
+            else:
+                preview_upserts[identity] = deepcopy(box)
+                original = objects.get(identity)
+                objects[identity] = dict(label=box['label'], editable=original['editable'] if original else True,
+                    reason=original['reason'] if original else None,
                     box=deepcopy(box), pose=deepcopy(box['pose']), kind='environment')
+        self._preview_edit = dict(base=deepcopy(edit['base']), upserts=preview_upserts,
+                                  removed=preview_removed) if edit and usable_edit else None
         scenario = document['request'].get('scenario', {})
-        groups = scenario.get('entity_groups', [])
+        groups, group_indices = [], {}
+        if not isinstance(scenario, dict):
+            issues.append('scenario 必须是对象；原输入保留，请在配置页补齐。')
+        else:
+            raw_groups = scenario.get('entity_groups', [])
+            if not isinstance(raw_groups, list):
+                issues.append('scenario.entity_groups 必须是列表')
+            else:
+                for index, group in enumerate(raw_groups):
+                    if (not isinstance(group, dict) or not isinstance(group.get('group_id'), str)
+                            or not group['group_id'] or type(group.get('count')) is not int or group['count'] < 0):
+                        issues.append(f'scenario.entity_groups[{index}] 需要 group_id 和非负整数 count')
+                    elif group['group_id'] in group_indices:
+                        issues.append(f"scenario.entity_groups[{index}] 重复 group_id {group['group_id']}")
+                    else:
+                        groups.append(group)
+                        group_indices[group['group_id']] = index
         for group in groups:
-            poses = scenario.get('placements', {}).get(group.get('placement_id'), [])
-            if not group.get('group_id') or type(group.get('count')) is not int:
-                continue
+            placements = scenario.get('placements', {})
+            placement_id = group.get('placement_id')
+            if not isinstance(placements, dict) or not isinstance(placement_id, str):
+                poses, placement_issue = [], 'placements 需要对象、placement_id 需要字符串'
+            else:
+                poses = placements.get(placement_id, [])
+                placement_issue = None
+                if not isinstance(poses, list):
+                    poses, placement_issue = [], f'placements.{placement_id} 必须是 pose 列表'
+            if placement_issue is not None:
+                del group_indices[group['group_id']]
             for slot in range(group['count']):
                 pose = poses[slot] if slot < len(poses) else None
+                issue = placement_issue or (_pose_issue(pose) if pose is not None else None)
                 identity = f"entity/{quote(group['group_id'], safe='')}/{slot}"
-                objects[identity] = dict(label=f"{group['group_id']} [{slot}]", editable=True,
-                    reason='待摆放 / 待绑定' if pose is None else None, box=None, pose=deepcopy(pose),
-                    kind='entity', group_id=group['group_id'], slot=slot)
+                model_ready = (isinstance(group.get('model_id'), str) and bool(group['model_id'])
+                               and type(group.get('model_revision')) is int and group['model_revision'] > 0)
+                objects[identity] = dict(label=f"{group['group_id']} [{slot}]", editable=issue is None,
+                    reason=issue or ('待摆放 / 待绑定' if pose is None else None), box=None,
+                    pose=None if issue else deepcopy(pose), kind='entity', group_id=group['group_id'], slot=slot,
+                    preview_entity=None if issue or pose is None or not model_ready else dict(
+                        object_id=identity, group_id=group['group_id'], slot=slot, model_id=group['model_id'],
+                        model_revision=group['model_revision'], pose=deepcopy(pose),
+                        sensor_profile_id=group.get('sensor_profile_id'), sensor_config=deepcopy(group.get('sensor_config', {}))))
         self.objects = objects
-        self.view.set_objects(objects, [g for g in groups if g.get('group_id') and type(g.get('count')) is int])
+        self._group_indices = group_indices
+        self.view.set_objects(objects, [group for group in groups if group['group_id'] in group_indices])
+        self.view.projection_status.setText('\n'.join(issues))
+        self.view.projection_status.setVisible(bool(issues))
         if self._pending_box is None:
             self._show_object()
 
@@ -209,13 +305,13 @@ class SceneController(QObject):
             self._intent('select', self.selected)
         self.stale = True
         request = document['request']
-        key = (request.get('environment_id'), request.get('environment_revision'))
+        key = (document['catalog_id'], request.get('environment_id'), request.get('environment_revision'))
         if key != self._manifest_key:
             self._release(unload=False)
             self._manifest = None
             self._manifest_key = key
-            if all(part is not None for part in key) and self._enabled and self.connection.state['state'] == 'connected':
-                self._request('manifest', 'GET', f'/catalog/environments/{key[0]}/{key[1]}/editing')
+            if all(part is not None for part in key[1:]) and self._enabled and self.connection.state['state'] == 'connected':
+                self._request('manifest', 'GET', f'/catalog/environments/{key[1]}/{key[2]}/editing')
         self._render()
         self.view.status.setText('预览更新中 / 旧图已过期' if self._manifest else '等待环境引用与可编辑manifest；研究配置可不完整。')
         self._schedule()
@@ -239,12 +335,17 @@ class SceneController(QObject):
             self.set_box(object_id, box)
         else:
             request = self.draft.document['request']
-            group = next(g for g in request['scenario']['entity_groups'] if g['group_id'] == obj['group_id'])
-            poses = _placement(request, group)
+            groups = self._draft_groups(request)
+            group = groups[obj['group_id']]
+            poses = _placement(request, group, groups)
             while len(poses) <= obj['slot']:
                 poses.append(None)  # 显式未摆放，不制造Pose进入preview。
             poses[obj['slot']] = deepcopy(pose)
             self.draft.commit_input(('request',), request, pending_path='scene.' + object_id)
+
+    def _draft_groups(self, request):
+        return {identity: request['scenario']['entity_groups'][index]
+                for identity, index in self._group_indices.items()}
 
     def set_box(self, object_id, box):
         obj = self.objects[object_id]
@@ -300,7 +401,7 @@ class SceneController(QObject):
                      and 'scene.' + identity in pending]
         # 只枚举_remove_slot实际写入的边界；列表结构沿用G3的整列表子树契约，不迁移raw路径。
         groups = before['scenario']['entity_groups']
-        index = next(i for i, group in enumerate(groups) if group['group_id'] == group_id)
+        index = self._group_indices[group_id]
         if len(after['scenario']['entity_groups']) < len(groups):
             paths = [('scenario', 'entity_groups', i) for i in range(index, len(groups))]
         else:
@@ -353,7 +454,7 @@ class SceneController(QObject):
         if obj['kind'] == 'entity':
             before = self.draft.document['request']
             request = deepcopy(before)
-            _remove_slot(request, obj['group_id'], obj['slot'])
+            _remove_slot(request, obj['group_id'], obj['slot'], self._draft_groups(request))
             cancelled = self._slot_pending_keys(obj['group_id'], [obj['slot']], before, request)
             impacts = self._remove_impacts(before, obj['group_id'], [obj['slot']], cancelled)
             if not self.view.confirm_removal(impacts):
@@ -381,7 +482,8 @@ class SceneController(QObject):
 
     def set_group_count(self, group_id, count):
         request = self.draft.document['request']
-        group = next(g for g in request['scenario']['entity_groups'] if g['group_id'] == group_id)
+        groups = self._draft_groups(request)
+        group = groups[group_id]
         old = group['count']
         if count == old:
             return
@@ -391,7 +493,7 @@ class SceneController(QObject):
             revision = self.draft.revision
             before = deepcopy(request)
             for slot in range(old - 1, count - 1, -1):
-                _remove_slot(request, group_id, slot)
+                _remove_slot(request, group_id, slot, groups)
             cancelled = self._slot_pending_keys(group_id, range(count, old), before, request)
             if not self.view.confirm_removal(self._remove_impacts(before, group_id, list(range(count, old)), cancelled)):
                 return
@@ -410,18 +512,10 @@ class SceneController(QObject):
 
     def preview_payload(self):
         document = self.draft.document
-        entities = []
-        for identity, obj in self.objects.items():
-            if obj['kind'] != 'entity' or obj['pose'] is None:
-                continue
-            group = next(g for g in document['request']['scenario']['entity_groups'] if g['group_id'] == obj['group_id'])
-            if not group.get('model_id') or not group.get('model_revision'):
-                continue
-            entities.append(dict(object_id=identity, group_id=obj['group_id'], slot=obj['slot'],
-                model_id=group['model_id'], model_revision=group['model_revision'], pose=deepcopy(obj['pose']),
-                sensor_profile_id=group.get('sensor_profile_id'), sensor_config=deepcopy(group.get('sensor_config', {}))))
+        entities = [deepcopy(obj['preview_entity']) for obj in self.objects.values()
+                    if obj['kind'] == 'entity' and obj['preview_entity'] is not None]
         return dict(draft_id=document['draft_id'], revision=self.draft.revision,
-            environment=deepcopy(self._manifest['base']), environment_edit=document['environment_edit'] or None, entities=entities)
+            environment=deepcopy(self._manifest['base']), environment_edit=deepcopy(self._preview_edit), entities=entities)
 
     def _schedule(self):
         if self._enabled and self._manifest and self.connection.state['state'] == 'connected' and not self._timer.isActive():
@@ -439,11 +533,11 @@ class SceneController(QObject):
             return
         if self._last_sent == self.draft.revision:
             return
-        self._force_next = False
-        self._updating = True
-        self._last_sent = self.draft.revision
-        self._request('update' if self.session_id else 'create', 'PUT' if self.session_id else 'POST',
-                      '/previews/' + self.session_id if self.session_id else '/previews', json=self.preview_payload())
+        if self._request('update' if self.session_id else 'create', 'PUT' if self.session_id else 'POST',
+                         '/previews/' + self.session_id if self.session_id else '/previews', json=self.preview_payload()):
+            self._force_next = False
+            self._updating = True
+            self._last_sent = self.draft.revision
 
     def _received(self, generation, token, result):
         if token == self._stream:

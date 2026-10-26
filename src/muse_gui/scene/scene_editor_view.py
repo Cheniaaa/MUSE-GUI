@@ -44,6 +44,10 @@ class SceneEditorView(QWidget):
         self.status = BodyLabel('尚无CPU预览；不要求研究配置完整。', self)
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
+        self.projection_status = BodyLabel('', self)
+        self.projection_status.setWordWrap(True)
+        self.projection_status.hide()
+        layout.addWidget(self.projection_status)
         self.tree = QTreeWidget(self)
         self.tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.tree.installEventFilter(self)
@@ -179,7 +183,7 @@ class SceneEditorView(QWidget):
         self.label_field.setEnabled(editable and box is not None)
         position = pose['position'] if pose else [None] * 3
         rotation = Rotation.from_quat([*pose['orientation_wxyz'][1:], pose['orientation_wxyz'][0]]).as_euler(
-            'xyz', degrees=True).tolist() if pose else [0., 0., 0.]
+            'xyz', degrees=True).tolist() if pose else [0., 0., 0.] if editable else [None] * 3
         for fields, values in ((self.position_fields, position), (self.rotation_fields, rotation),
                                (self.size_fields, box['size_m'] if box else [None] * 3)):
             prefix = 'position' if fields is self.position_fields else 'rotation' if fields is self.rotation_fields else 'size'

@@ -23,7 +23,8 @@ class WorkbenchController(QObject):
         self.window, self.draft, self.connection = window, draft, connection
         self.configuration = configuration
         self._view_context = None
-        self._run_catalog_id = None
+        self._run_contexts = {}
+        self._results_catalog_id = None
         self._visible_scene_context = None
         self._connected_generation = None
         self._new_run_ids = set()
@@ -129,6 +130,12 @@ class WorkbenchController(QObject):
         self.window.workbench.set_page('scene')
         self.window.switchTo(self.window.workbench)
 
+    @property
+    def _run_catalog_id(self):
+        if self._view_context is not None and self._view_context[0] == 'run':
+            return self._run_contexts[self._view_context[1]]['catalog_id']
+        return None
+
     def _context_changed(self, kind, identity):
         if self._view_context == (kind, identity):
             return
@@ -138,18 +145,35 @@ class WorkbenchController(QObject):
                 self.run.close_tab(previous_id)
         self._view_context = (kind, identity)
         if kind == 'run':
-            self._run_catalog_id = self.connection.state['catalog_id']
-            self.run.open(identity, new_run=identity in self._new_run_ids)
+            context = self._run_contexts.setdefault(identity, {
+                'catalog_id': self.connection.state['catalog_id'], 'state': None})
+            self.run_view.catalog_id = context['catalog_id']
+            if (self.connection.state['state'] == 'connected'
+                    and context['catalog_id'] == self.connection.state['catalog_id']):
+                self.run.open(identity, new_run=identity in self._new_run_ids)
+                context['state'] = self.run.state
+            else:
+                from muse_gui.runs.run_state import RunState
+                if context['state'] is None:
+                    context['state'] = RunState(identity, self.connection.state['generation'])
+                self.run.state = context['state']
+                self.run.state.connected = False
+                self.run.changed.emit()
             self._new_run_ids.discard(identity)
         if self.results is not None:
-            if kind == 'draft':
+            readable = (kind == 'run' and self.connection.state['state'] == 'connected'
+                        and self._run_catalog_id == self.connection.state['catalog_id'])
+            if not readable:
                 self.results.controller.stop()
                 self.results.refresh_timer.stop()
                 self.results.replay.close_replay()
-            elif identity not in self.results.controller.series:
+            elif (self._results_catalog_id != self._run_catalog_id
+                  or identity not in self.results.controller.series):
                 self.results.show_runs([identity])
+                self._results_catalog_id = self._run_catalog_id
             elif not self.results.controller.active:
                 self.results.show_runs(list(self.results.controller.series))
+            self.results.setVisible(kind == 'run' and self._results_catalog_id == self._run_catalog_id)
         self.start_button.setVisible(kind == 'draft')
         self.cancel_submission.setVisible(kind == 'draft')
         self.find_run.setVisible(kind == 'draft')
@@ -178,16 +202,19 @@ class WorkbenchController(QObject):
     def close_current_run(self):
         workbench = self.window.workbench
         if workbench.context_kind == 'run':
-            workbench.close_run_context(workbench.context_identity)
+            identity = workbench.context_identity
+            workbench.close_run_context(identity)
+            self._run_contexts.pop(identity)
 
     def copy_run(self, context, mode):
+        catalog_id = self._run_catalog_id
         def apply():
             options = {'mode': mode, 'max_decision_steps': context['record']['max_decision_steps']}
             recording = context['record'].get('recording')
             options['recording'] = deepcopy(recording['config']) if recording else None
             if context['checkpoint_artifact_id'] is not None:
                 options['checkpoint_artifact_id'] = context['checkpoint_artifact_id']
-            self._replace_source(context['source'], options, 'Run 派生实验')
+            self._replace_source(context['source'], options, 'Run 派生实验', catalog_id=catalog_id)
             self.window.workbench.set_page('config')
         self.window._confirm_replace(apply)
 
@@ -227,27 +254,30 @@ class WorkbenchController(QObject):
             if (self._view_context is not None and self._view_context[0] == 'run'
                     and self._run_catalog_id == state['catalog_id']):
                 self.run.open(self._view_context[1], new_run=False)
+                self._run_contexts[self._view_context[1]]['state'] = self.run.state
 
     def _cache_result(self, generation, token, result):
         if 'cache_error' in result:
             self.window.workbench.show_message('在线数据已读取；本机缓存写入失败：' + str(result['cache_error']))
 
-    def _replace_source(self, request, run_options, name):
+    def _replace_source(self, request, run_options, name, *, catalog_id):
         self.draft.replace_document(dict(format_version=1, draft_id=str(uuid4()), name=name,
-            catalog_id=self.connection.state['catalog_id'], request=deepcopy(request),
+            catalog_id=catalog_id, request=deepcopy(request),
             run_options=deepcopy(run_options), environment_edit={}, pending_inputs={}))
         self.window.workbench.set_context('draft', self.draft.document['draft_id'])
         self.window.switchTo(self.window.workbench)
 
     def accept_example(self, example):
         def apply():
-            self._replace_source(example['request'], example['run_options'], '参考实验')
+            self._replace_source(example['request'], example['run_options'], '参考实验',
+                                 catalog_id=self.connection.state['catalog_id'])
             self.window.workbench.show_message('模板研究状态：' + json.dumps(example['research_status'], ensure_ascii=False))
             self.configuration.refresh_catalog()
         self.window._confirm_replace(apply)
 
     def copy_source(self, source):
-        self.window._confirm_replace(lambda: self._replace_source(source, {}, '实验副本'))
+        catalog_id = self.connection.state['catalog_id']
+        self.window._confirm_replace(lambda: self._replace_source(source, {}, '实验副本', catalog_id=catalog_id))
 
     def select_resource(self, record):
         document = self.draft.document
@@ -345,6 +375,15 @@ class WorkbenchController(QObject):
         self.window.switchTo(self.window.history_host)
 
     def show_results(self, run_ids):
+        catalog_ids = {self._run_contexts[identity]['catalog_id'] if identity in self._run_contexts
+                       else self.connection.state['catalog_id'] for identity in run_ids}
+        if (self.connection.state['state'] != 'connected'
+                or catalog_ids - {self.connection.state['catalog_id']}):
+            message = '结果请求已拒绝：请连接 Run 原 Catalog；本地旧快照仍可查看和复制。'
+            self.window.workbench.show_message(message)
+            if self._view_context is not None and self._view_context[0] == 'run':
+                self.run_view.message.setText(message)
+            return
         url = self.settings.profile()['base_url']
         if self.results is not None:
             self.results.close()
@@ -361,6 +400,7 @@ class WorkbenchController(QObject):
                     item.widget().deleteLater()
             layout.setContentsMargins(0, 0, 0, 0)
         self.results = ResultsView(self.connection, self.window.workbench.metrics_host, source_url=url)
+        self._results_catalog_id = self.connection.state['catalog_id']
         self._results_scroll = self.window.workbench._scroll(self.results)
         self.window.workbench.metrics_host.layout().addWidget(self._results_scroll)
         self.results.show_runs(run_ids)

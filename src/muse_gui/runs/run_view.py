@@ -16,6 +16,7 @@ class RunView(QWidget):
     def __init__(self, controller, parent=None):
         super().__init__(parent)
         self.controller = controller
+        self.catalog_id = None
         self._settings_key = {"viser": None, "native": None}
         self._artifact_ids = None
         layout = QVBoxLayout(self)
@@ -176,7 +177,7 @@ class RunView(QWidget):
         if not ready:
             self.run_status.setText(f"Run {state.run_id}：正在读取 Server 记录" if state else "尚未打开 Run")
             self.command_status.setText("命令：none；暂停状态未知")
-            self.connection_status.setText("正在读取；不沿用上一 Run 的真值")
+            self.connection_status.setText(f"Catalog {self.catalog_id} · 正在读取；不沿用上一 Run 的真值")
             self.display_status.setText("等待 Server 显示状态")
             self.native_status.setText("等待 Server Native 状态")
             self.viewer_status.setText("网页未加载")
@@ -191,7 +192,8 @@ class RunView(QWidget):
             return
         record = state.record
         self.run_status.setText(f"Run {state.run_id} · {record['mode']} · {record['state']}")
-        self.connection_status.setText("已连接 Server" if state.connected else "连接断开；以下为最后已知状态，Run 不因此失败")
+        self.connection_status.setText(f"Catalog {self.catalog_id} · " + (
+            "已连接 Server" if state.connected else "原 Catalog 连接断开；以下为最后已知状态，Run 不因此失败"))
         self.message.setText(str(state.error or record.get("failure") or ""))
         recording = record.get("recording")
         self.recording_status.setText("诊断轨迹（独立于实时viewer）：\n" + json.dumps(recording, ensure_ascii=False)

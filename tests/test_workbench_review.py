@@ -57,6 +57,133 @@ def test_current_run_reconnects_only_to_its_catalog(integrated, transport, catal
                    for _, method, path, _ in requests)
 
 
+@pytest.mark.parametrize('catalog', ['catalog-a', 'catalog-b', None])
+def test_reselected_run_retains_source_and_local_snapshot(integrated, transport, catalog):
+    window, draft, connection, controller = integrated
+    requests, _, answer = transport
+    controller.mount_views()
+    controller.open_run('from-a')
+    answer('/runs/from-a', record(run='from-a'))
+    answer('/experiments/e/source', {'environment_id': 'env-from-a', 'environment_revision': 1})
+    answer('/experiments/e', {'topology': {'world_count': 1}})
+    connection._set_state(state='disconnected', generation=2)
+    if catalog is not None:
+        connection._set_state(state='connected', generation=3, catalog_id=catalog)
+    window.workbench.set_context('draft', draft.document['draft_id'])
+    requests.clear()
+    controller.open_run('from-a')
+    if catalog == 'catalog-a':
+        assert any(item[1:3] == ('GET', '/runs/from-a') for item in requests)
+    else:
+        assert not any(item[2].startswith('/runs/from-a') for item in requests)
+        assert controller.run.state.record['run_id'] == 'from-a'
+        assert controller.run.state.source['environment_id'] == 'env-from-a'
+        assert controller.run_view.details_button.isEnabled()
+        assert controller.run_view.evaluate_button.isEnabled()
+        assert not controller.run.can_command
+        assert 'catalog-a' in controller.run_view.connection_status.text()
+
+
+def test_old_run_results_button_rejects_foreign_catalog_without_replacing_snapshot(integrated, transport):
+    window, _, connection, controller = integrated
+    requests, _, answer = transport
+    controller.mount_views()
+    controller.open_run('from-a')
+    answer('/runs/from-a', record(run='from-a'))
+    window.workbench.set_page('config')
+    controller.run_view.results_button.click()
+    results = controller.results
+    answer('/runs/from-a', record(run='from-a'))
+    connection._set_state(state='disconnected', generation=2)
+    connection._set_state(state='connected', generation=3, catalog_id='catalog-b')
+    requests.clear()
+    controller.run_view.results_button.click()
+    assert requests == []
+    assert controller.results is results
+    assert results.controller.runs['from-a']['run_id'] == 'from-a'
+    assert 'Catalog' in window.workbench.message_label.text()
+    assert controller.run_view.message.isVisible()
+    assert 'Catalog' in controller.run_view.message.text()
+
+
+def test_reselected_snapshot_keeps_existing_error_and_shows_catalog(integrated, transport):
+    window, draft, connection, controller = integrated
+    _, _, answer = transport
+    controller.mount_views()
+    controller.open_run('from-a')
+    answer('/runs/from-a', record(run='from-a'))
+    error = {'operation': 'command', 'outcome': 'unknown', 'message': '命令结果未确认'}
+    controller.run.state.error = deepcopy(error)
+    connection._set_state(state='disconnected', generation=2)
+    window.workbench.set_context('draft', draft.document['draft_id'])
+    controller.open_run('from-a')
+    assert controller.run.state.error == error
+    assert 'catalog-a' in controller.run_view.connection_status.text()
+
+
+def test_old_results_navigation_does_not_rebind_on_foreign_reselect(integrated, transport):
+    window, draft, connection, controller = integrated
+    requests, _, answer = transport
+    controller.mount_views()
+    controller.show_results(['from-a'])
+    results = controller.results
+    connection._set_state(state='disconnected', generation=2)
+    connection._set_state(state='connected', generation=3, catalog_id='catalog-b')
+    window.workbench.set_context('draft', draft.document['draft_id'])
+    requests.clear()
+    controller.open_run('from-a')
+    assert requests == []
+    assert controller.results is results
+    assert not results.controller.active
+
+
+@pytest.mark.parametrize('online', [False, True])
+def test_copy_old_run_keeps_catalog_and_checkpoint_without_foreign_preview(integrated, transport, online):
+    window, draft, connection, controller = integrated
+    requests, _, answer = transport
+    controller.mount_views()
+    controller.open_run('from-a')
+    answer('/runs/from-a', record(run='from-a'))
+    source = {'environment_id': 'env-from-a', 'environment_revision': 1}
+    answer('/experiments/e/source', source)
+    answer('/experiments/e', {'topology': {'world_count': 1}})
+    answer('/runs/from-a/artifacts', [{'id': 'checkpoint-from-a', 'kind': 'checkpoint'}])
+    controller.run_view.checkpoint_selector.setCurrentIndex(1)
+    connection._set_state(state='disconnected', generation=2)
+    if online:
+        connection._set_state(state='connected', generation=3, catalog_id='catalog-b')
+    window._ask_unsaved = lambda: 'discard'
+    requests.clear()
+    controller.run_view.continue_button.click()
+    controller.scene.refresh_preview()
+    assert draft.document['catalog_id'] == 'catalog-a'
+    assert draft.document['request'] == source
+    assert draft.document['run_options']['checkpoint_artifact_id'] == 'checkpoint-from-a'
+    assert not any(item[2].startswith(('/catalog/environments/env-from-a', '/previews')) for item in requests)
+    if online:
+        assert 'Catalog' in controller.scene_view.message.text()
+
+
+@pytest.mark.parametrize('catalog', ['catalog-a', 'catalog-b'])
+def test_draft_preview_reconnect_respects_draft_catalog(integrated, transport, catalog):
+    _, draft, connection, controller = integrated
+    requests, _, answer = transport
+    controller.mount_views()
+    draft.set_value(('request',), {'environment_id': 'env-from-a', 'environment_revision': 1})
+    answer('/catalog/environments/env-from-a/1/editing', {
+        'base': {'resource_id': 'env-from-a', 'revision': 1, 'sha256': 'a' * 64}, 'objects': []})
+    connection._set_state(state='disconnected', generation=2)
+    requests.clear()
+    connection._set_state(state='connected', generation=3, catalog_id=catalog)
+    controller.scene.flush_preview()
+    scene_requests = [item for item in requests if item[0].startswith('scene:')]
+    if catalog == 'catalog-a':
+        assert any(item[1:3] == ('GET', '/catalog/environments/env-from-a/1/editing') for item in scene_requests)
+    else:
+        assert scene_requests == []
+        assert 'Catalog' in controller.scene_view.message.text()
+
+
 @pytest.mark.parametrize('destination', ['config', 'settings_host', 'history_host', 'resources_host'])
 def test_hidden_run_viewport_is_released_and_restored_locally(integrated, transport, wait_until, destination):
     window, _, _, controller = integrated
