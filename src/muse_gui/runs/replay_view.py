@@ -113,6 +113,8 @@ class ReplayView(QWidget):
         split.addWidget(tabs)
         split.setStretchFactor(0, 2)
         split.setStretchFactor(1, 1)
+        # 网页异步创建前host无sizeHint；先分配空间，避免零宽折叠一直保留。
+        split.setSizes([2 * tabs.sizeHint().width(), tabs.sizeHint().width()])
         layout.addWidget(split, 1)
         self.message = BodyLabel(self)
         self.message.setWordWrap(True)

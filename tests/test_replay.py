@@ -59,6 +59,19 @@ def opened(qapp):
     return connection, host, controller
 
 
+def test_empty_replay_viewport_is_allocated_before_async_webview_load(qapp):
+    from muse_gui.runs.replay_view import ReplayView
+    view = ReplayView(OrderedConnection())
+    view.resize(1100, 600)
+    view.show()
+    qapp.processEvents()
+    try:
+        assert view.viewer.width() > 0
+        assert not view.viewer.visibleRegion().isEmpty()
+    finally:
+        view.close()
+
+
 def test_replay_accepts_backward_seek_but_rejects_old_generation_and_session():
     from muse_gui.runs.replay_state import ReplayState
     state = ReplayState(source(), 1)
