@@ -178,6 +178,37 @@ def test_command_error_after_applied_state_remains_visible(qapp):
     controller.close()
 
 
+@pytest.mark.parametrize('text', ['nan', '1e309', '-inf'])
+def test_nonfinite_speed_input_preserves_replay_and_active_export(qapp, monkeypatch, text):
+    from muse_gui.runs import replay_view
+    monkeypatch.setattr(replay_view, 'ViewerHost', Host)
+    connection = OrderedConnection()
+    view = replay_view.ReplayView(connection)
+    export = {'export_id': 'video', 'status': 'rendering', 'frames_written': 1,
+              'total_frames': 18, 'artifact_id': None, 'error': None}
+    view.open(source())
+    connection.answer('/replays', snapshot(camera_ready=True, export=export), method='POST')
+    try:
+        view.speed_edit.setText(text)
+        view.speed_button.click()
+        assert not connection.sent
+        assert view.message.text()
+        assert view.controller.ready and view.controller.state.requested_command is None
+        assert view.controller.state.data['export'] == export
+        assert connection.subscriptions and view.viewer.unloaded == 0
+        assert not any(request[1] == 'DELETE' for request in connection.requests)
+
+        view.speed_edit.setText('1.5')
+        view.speed_button.click()
+        assert connection.sent == [('/streams/replays/A', {'kind': 'playback', 'command': {
+            'command_seq': 1, 'kind': 'speed', 'speed': 1.5}})]
+        connection.push('/replays/A', {'kind': 'state', **snapshot(
+            revision=11, speed=1.5, last_command_seq=1, camera_ready=True, export=export)})
+        assert view.controller.state.data['speed'] == 1.5 and view.controller.ready
+    finally:
+        view.close_replay()
+
+
 def test_view_uses_same_sample_role_slot_and_nonstep_not_applicable(qapp, monkeypatch):
     from muse_gui.runs import replay_view
     monkeypatch.setattr(replay_view, "ViewerHost", Host)

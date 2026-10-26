@@ -1,5 +1,6 @@
 """Fluent历史面板；独立于Run实时状态和控制按钮。"""
 import json
+import math
 
 from PySide6.QtCore import QSignalBlocker, Qt
 from PySide6.QtWidgets import (QAbstractItemView, QHBoxLayout, QSplitter, QTableWidgetItem,
@@ -139,9 +140,13 @@ class ReplayView(QWidget):
 
     def _speed(self):
         try:
-            self.controller.playback('speed', speed=float(self.speed_edit.text()))
+            speed = float(self.speed_edit.text())
+            if not math.isfinite(speed):
+                raise ValueError('倍速必须为有限数值')
         except ValueError:
-            self.message.setText('倍速请输入数字；有效范围由Server裁决。')
+            self.message.setText('倍速请输入有限数字；有效范围由Server裁决。')
+            return
+        self.controller.playback('speed', speed=speed)
 
     def _export(self):
         try:
