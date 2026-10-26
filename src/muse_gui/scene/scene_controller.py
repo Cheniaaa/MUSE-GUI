@@ -24,12 +24,14 @@ def _pose_issue(pose):
     return None
 
 
-def _placement(request, group, groups):
+def _placement(request, group):
     """选中组修改共享placement时拆开引用，不能移动未选中的组。"""
     scenario = request['scenario']
     identity = group['placement_id']
     placements = scenario.setdefault('placements', {})
-    if any(other is not group and other.get('placement_id') == identity for other in groups.values()):
+    # 部分group仍拥有其引用；可编辑投影不是共享placement所有者的全集。
+    if any(isinstance(other, dict) and other is not group and other.get('placement_id') == identity
+           for other in scenario['entity_groups']):
         new = 'placement-' + uuid4().hex
         placements[new] = deepcopy(placements.get(identity, []))
         group['placement_id'] = identity = new
@@ -39,7 +41,7 @@ def _placement(request, group, groups):
 def _remove_slot(request, group_id, slot, groups):
     scenario = request['scenario']
     group = groups[group_id]
-    placements = _placement(request, group, groups)
+    placements = _placement(request, group)
     if slot < len(placements):
         placements.pop(slot)
     group['count'] -= 1
@@ -337,7 +339,7 @@ class SceneController(QObject):
             request = self.draft.document['request']
             groups = self._draft_groups(request)
             group = groups[obj['group_id']]
-            poses = _placement(request, group, groups)
+            poses = _placement(request, group)
             while len(poses) <= obj['slot']:
                 poses.append(None)  # 显式未摆放，不制造Pose进入preview。
             poses[obj['slot']] = deepcopy(pose)

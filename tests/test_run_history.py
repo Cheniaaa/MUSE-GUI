@@ -6,7 +6,7 @@ from pathlib import Path
 from threading import Thread
 
 import pytest
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QItemSelectionModel, QObject, Qt, Signal
 
 from muse_gui.backend.connection_controller import ConnectionController
 from muse_gui.runs.history_view import HistoryView
@@ -83,6 +83,62 @@ def test_history_filters_and_pagination_are_server_queries(qapp):
     view.next_page()
     assert connection.requests[-1][3]["params"]["offset"] == 50
     view.close()
+
+
+@pytest.mark.parametrize('refresh_outcome', ['pending', 'error'])
+def test_history_catalog_switch_blocks_old_selection_until_current_page(qapp, refresh_outcome):
+    connection = OrderedConnection()
+    view = HistoryView(connection)
+    opened, compared, copied = [], [], []
+    view.open_requested.connect(opened.append)
+    view.compare_requested.connect(compared.append)
+    view.copy_requested.connect(copied.append)
+    old_page = {'items': [{'run_id': 'a1', 'experiment_id': 'ea1', 'mode': 'TRAIN', 'state': 'COMPLETED'},
+                          {'run_id': 'a2', 'experiment_id': 'ea2', 'mode': 'TRAIN', 'state': 'COMPLETED'}],
+                'next_offset': 50}
+    view.set_page(old_page)
+    view.table.selectRow(0)
+    view.next_page()
+    late = connection.requests[-1][0]
+    connection.state.update(state='disconnected', generation=2)
+    connection.state_changed.emit(connection.state.copy())
+    connection.state.update(state='connected', generation=3, catalog_id='catalog-b')
+    connection.state_changed.emit(connection.state.copy())
+    view.refresh()
+    current = connection.requests[-1][0]
+    connection.result_received.emit(1, late, {'ok': True, 'data': old_page})
+    if refresh_outcome == 'error':
+        connection.result_received.emit(3, current, {'ok': False, 'error': {'message': 'query failed'}})
+    before = list(connection.requests)
+    try:
+        view.table.selectRow(0)
+        view.open_selected()
+        view.copy_selected()
+        view.table.selectionModel().select(view.table.model().index(1, 0),
+            QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+        view.compare_selected()
+        assert not opened and not compared and not copied
+        assert connection.requests == before
+        assert view.table.rowCount() == 0 and not view.next_button.isEnabled()
+
+        view.refresh()
+        current = connection.requests[-1][0]
+        new_page = {'items': [{'run_id': 'b1', 'experiment_id': 'eb1', 'mode': 'TRAIN', 'state': 'COMPLETED'},
+                              {'run_id': 'b2', 'experiment_id': 'eb2', 'mode': 'TRAIN', 'state': 'COMPLETED'}],
+                    'next_offset': None}
+        connection.result_received.emit(3, current, {'ok': True, 'data': new_page})
+        view.table.selectRow(0)
+        view.open_selected()
+        view.copy_selected()
+        assert opened == ['b1'] and connection.requests[-1][2] == '/experiments/eb1/source'
+        connection.result_received.emit(3, connection.requests[-1][0], {'ok': True, 'data': {'root_seed': 17}})
+        assert copied == [{'root_seed': 17}]
+        view.table.selectionModel().select(view.table.model().index(1, 0),
+            QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+        view.compare_selected()
+        assert compared == [['b1', 'b2']]
+    finally:
+        view.close()
 
 
 def test_results_ignore_stale_runs_and_close_is_local(qapp):

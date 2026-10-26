@@ -85,6 +85,35 @@ def test_formed_neighbor_pose_edit_preserves_null_group_and_undo(empty_scene):
     assert draft.document == before
 
 
+@pytest.mark.parametrize('operation', ['pose', 'remove_slot', 'remove_group', 'count_zero'])
+def test_partial_group_retains_its_shared_placement_during_neighbor_edits(empty_scene, operation):
+    draft, view, controller, _, _ = empty_scene
+    count = 1 if operation == 'remove_group' else 2
+    poses = [deepcopy(POSE) for _ in range(count)]
+    partial = {'group_id': 'partial', 'placement_id': 'start'}
+    draft.set_value(('request',), {'scenario': {
+        'entity_groups': [None, partial, {'group_id': 'uav', 'count': count, 'placement_id': 'start'}],
+        'placements': {'start': poses},
+    }})
+    view.confirm_removal = lambda impacts: True
+    before = draft.document
+    if operation == 'pose':
+        controller.set_pose('entity/uav/0', {**deepcopy(POSE), 'position': [9., 8., 7.]})
+    elif operation == 'count_zero':
+        controller.set_group_count('uav', 0)
+    else:
+        controller.remove_object('entity/uav/0')
+    scenario = draft.document['request']['scenario']
+    assert scenario['entity_groups'][:2] == [None, partial]
+    assert scenario['placements']['start'] == poses
+    if operation in ('pose', 'remove_slot'):
+        assert scenario['entity_groups'][2]['placement_id'] != 'start'
+    else:
+        assert len(scenario['entity_groups']) == 2
+    draft.undo_stack.undo()
+    assert draft.document == before
+
+
 def test_corrected_scenario_clears_projection_reason_without_hiding_preview_error(empty_scene):
     from qfluentwidgets import BodyLabel
     draft, view, controller, _, _ = empty_scene

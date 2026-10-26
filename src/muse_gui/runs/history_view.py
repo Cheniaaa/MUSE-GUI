@@ -75,6 +75,7 @@ class HistoryView(QWidget):
     def refresh(self) -> None:
         self._epoch += 1
         self._pending.clear()
+        self.set_page({"items": [], "next_offset": None})
         self._filters = {}
         if self.mode_filter.currentIndex():
             self._filters["mode"] = self.mode_filter.currentText()
@@ -82,6 +83,7 @@ class HistoryView(QWidget):
             self._filters["state"] = self.state_filter.currentText()
         if self.experiment_filter.text().strip():
             self._filters["experiment_id"] = self.experiment_filter.text().strip()
+        self.status.setText("正在查询当前 Catalog 的历史。")
         self._request("page", "/runs", params={**self._filters, "offset": 0, "limit": 50})
 
     def next_page(self) -> None:
@@ -134,7 +136,8 @@ class HistoryView(QWidget):
     def _connection_changed(self, state):
         if state["state"] != "connected":
             self._pending.clear()
-            self.status.setText("连接已失效；当前历史仅为旧显示，重连后请重新查询。")
+            self.set_page({"items": [], "next_offset": None})
+            self.status.setText("连接已失效；已清除旧历史选择，重连后请重新查询。")
 
     def closeEvent(self, event):
         self._pending.clear()
