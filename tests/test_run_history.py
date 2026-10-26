@@ -11,6 +11,7 @@ from PySide6.QtCore import QObject, Qt, Signal
 from muse_gui.backend.connection_controller import ConnectionController
 from muse_gui.runs.history_view import HistoryView
 from muse_gui.runs.results_view import ResultsView
+from muse_gui.runs.results_controller import ResultsController
 
 
 class OrderedConnection(QObject):
@@ -29,6 +30,25 @@ class OrderedConnection(QObject):
         request = next(r for r in self.requests if r[2] == path)
         self.requests.remove(request)
         self.result_received.emit(1, request[0], {"ok": True, "data": data})
+
+
+def test_artifacts_remain_bound_to_original_catalog_and_generation(qapp, tmp_path):
+    connection = OrderedConnection()
+    controller = ResultsController(connection, source_url="http://original")
+    controller.show_runs(["r"])
+    artifact = {"id": "t", "run": "r", "kind": "trajectory", "path": "trajectories/t.zip", "size": 2, "sha256": "x"}
+    connection.answer("/runs/r/artifacts", [artifact])
+    origin = controller.artifact_source(artifact)
+    assert origin["catalog_id"] == "catalog" and origin["generation"] == 1
+    connection.state.update(catalog_id="other", generation=2)
+    before = list(connection.requests)
+    with pytest.raises(ValueError):
+        controller.artifact_source(artifact)
+    with pytest.raises(ValueError):
+        controller.download_artifact(artifact, tmp_path / "old.zip")
+    controller.refresh_artifacts()
+    assert connection.requests == before
+    controller.stop()
 
 
 def test_history_copy_preserves_explicit_overrides(qapp):
@@ -214,7 +234,12 @@ def test_real_artifact_download_keeps_complete_bytes_and_provenance(qapp, wait_u
             else:
                 data = {"/health": {"api_revision": 2, "catalog_id": "c", "instance_id": "s"},
                         "/catalog/schema": {}, "/catalog/environments": {"items": []},
-                        "/catalog/training-packages": {"items": []}, "/runs": {"items": [], "next_offset": None}}[self.path]
+                        "/catalog/training-packages": {"items": []}, "/runs": {"items": [], "next_offset": None},
+                        "/runs/r": {"run_id": "r", "experiment_id": "e"},
+                        "/runs/r/artifacts": [manifest], "/experiments/e/source": {}, "/experiments/e": {},
+                        "/runs/r/metrics?offset=0&limit=2000": {"records": [], "next_offset": 0, "eof": True, "terminal": True, "availability": "available"},
+                        "/runs/r/logs?channel=worker&offset=0&limit=65536": {"data_base64": "", "next_offset": 0, "eof": True, "terminal": True, "availability": "available"},
+                        "/runs/r/logs?channel=viser&offset=0&limit=65536": {"data_base64": "", "next_offset": 0, "eof": True, "terminal": True, "availability": "available"}}[self.path]
                 body = json.dumps(data).encode()
                 content_type = "application/json"
             self.send_response(200)
@@ -236,6 +261,8 @@ def test_real_artifact_download_keeps_complete_bytes_and_provenance(qapp, wait_u
     try:
         connection.connect({"base_url": f"http://127.0.0.1:{server.server_port}"})
         wait_until(lambda: connection.state["state"] == "connected" and not connection.has_pending_requests)
+        view.show_runs(['r'])
+        wait_until(lambda: view.controller.artifacts.get('r') == [manifest])
         destination = tmp_path / "full.jsonl"
         view.controller.download_artifact(manifest, destination)
         wait_until(lambda: bool(completed))

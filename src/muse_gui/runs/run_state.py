@@ -93,6 +93,8 @@ class RunState:
             self.apply_interaction({"command": command, "result": payload})
         elif kind == "metric":
             self.record["metrics"] = deepcopy(payload)
+        elif kind == "recording_state":
+            self.record["recording"] = deepcopy(payload)
 
     def apply_display(self, snapshot: dict) -> None:
         merged = self.display.copy() if self.display is not None else {}

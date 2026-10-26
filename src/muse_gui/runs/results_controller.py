@@ -60,6 +60,8 @@ class ResultsController(QObject):
         self.sources = {}
         self.definitions = {}
         self.artifacts = {}
+        self._artifact_origins = {}
+        self._source_context = None
         self.metric_pages = {}
         self.log_pages = {}
         self._manual_metrics = set()
@@ -83,6 +85,8 @@ class ResultsController(QObject):
         self.series = {run: MetricSeries() for run in run_ids}
         self.logs = {(run, channel): LogBuffer() for run in run_ids for channel in ("worker", "viser")}
         self.runs, self.sources, self.definitions, self.artifacts = {}, {}, {}, {}
+        self._artifact_origins = {}
+        self._source_context = {key: self.connection.state[key] for key in ('catalog_id', 'instance_id', 'generation')}
         self.metric_pages, self.log_pages = {}, {}
         self._manual_metrics.clear()
         self._manual_logs.clear()
@@ -157,17 +161,31 @@ class ResultsController(QObject):
         self.poll()
 
     def refresh_artifacts(self) -> None:
+        if not self.active or not self._current_source():
+            return
+        self._pending = {token: value for token, value in self._pending.items() if value[2] != 'artifacts'}
         for run in self.series:
             self._request("artifacts", run, f"/runs/{run}/artifacts")
 
+    def _current_source(self):
+        state = self.connection.state
+        return (self._source_context is not None and state['state'] == 'connected'
+                and all(state[key] == self._source_context[key] for key in ('generation', 'catalog_id')))
+
+    def artifact_source(self, artifact: dict) -> dict:
+        origin = self._artifact_origins.get((artifact['run'], artifact['id']))
+        if origin is None or not self._current_source():
+            raise ValueError('旧Catalog/连接的artifact只读；请在原Catalog连接中重新打开Run。')
+        return deepcopy(origin)
+
     def download_artifact(self, artifact: dict, destination: Path) -> None:
+        source = self.artifact_source(artifact)
         token = self._token()
         path = f"/runs/{quote(artifact['run'], safe='')}/artifacts/{quote(artifact['id'], safe='')}"
         provenance = {"artifact": deepcopy(artifact), "path": path,
                       "url": self.source_url + path,
-                      "catalog_id": self.connection.state["catalog_id"],
-                      "instance_id": self.connection.state["instance_id"]}
-        self._downloads[token] = (self.connection.state["generation"], destination, provenance)
+                       "catalog_id": source["catalog_id"], "instance_id": source["instance_id"]}
+        self._downloads[token] = (source["generation"], destination, provenance)
         self.connection.download(token, path, destination)
 
     def _token(self):
@@ -229,6 +247,9 @@ class ResultsController(QObject):
             self.definitions[key] = data
         else:
             self.artifacts[key] = data
+            self._artifact_origins = {identity: origin for identity, origin in self._artifact_origins.items() if identity[0] != key}
+            for artifact in data:
+                self._artifact_origins[(key, artifact['id'])] = dict(self._source_context, run_id=key, artifact_id=artifact['id'])
         self.changed.emit()
 
     def _verified(self, worker):
@@ -236,7 +257,7 @@ class ResultsController(QObject):
         worker.deleteLater()
 
     def _connection_changed(self, state):
-        if state["state"] != "connected":
+        if state["state"] != "connected" or self._source_context is not None and not self._current_source():
             self.stop()
             if self._downloads:
                 self.error.emit({"operation": "download", "message": "连接失效，下载结果未确认；可能存在不完整文件，请重新下载并校验。"})

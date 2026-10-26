@@ -81,6 +81,21 @@ def test_submission_keeps_captured_revision(components):
     assert draft.document == edited_after_capture
 
 
+def test_submission_freezes_recording_options_without_leaking_to_experiment(components):
+    draft, connection, _, submission = components
+    options = {'mode': 'TRAIN', 'max_decision_steps': 10, 'recording': {
+        'world_ids': [0, 1], 'every_n_decisions': 3, 'max_data_bytes': 4096}}
+    draft.set_value(('run_options',), options)
+    submission.start(draft.document['run_options'], 'registered')
+    draft.set_value(('run_options', 'recording', 'every_n_decisions'), 99)
+    frozen = next(r for r in connection.requests if r[2] == '/experiments')[3]['json']
+    assert 'recording' not in frozen
+    connection.answer('/experiments', {'experiment_id': 'frozen'})
+    request = next(r for r in connection.requests if r[2] == '/runs')
+    assert request[3]['json'] == dict(options, experiment_id='frozen')
+    connection.answer('/runs', {'run_id': 'r', 'state': 'QUEUED'})
+
+
 def test_cancel_during_derive_does_not_freeze_or_create_run(components):
     draft, connection, resources, submission = components
     draft.set_value(("environment_edit",), {"base": {"resource_id": "env", "revision": 1, "sha256": "old"}, "upserts": {}, "removed": ["box"]})

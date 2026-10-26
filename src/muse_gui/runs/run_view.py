@@ -25,6 +25,9 @@ class RunView(QWidget):
         self.message.setWordWrap(True)
         for widget in (self.run_status, self.connection_status, self.message):
             layout.addWidget(widget)
+        self.recording_status = BodyLabel("录制：等待读取冻结请求", self)
+        self.recording_status.setWordWrap(True)
+        layout.addWidget(self.recording_status)
         commands = QHBoxLayout()
         for attribute, text, command in (("pause_button", "暂停", "pause"), ("resume_button", "继续", "resume"),
                                           ("step_button", "单步（整个 Run 一次 decision）", "step")):
@@ -180,6 +183,7 @@ class RunView(QWidget):
             self.pairing_status.setText("选择同步未就绪")
             self.frame_status.setText("实体无实时帧")
             self.message.setText(str(state.error or "") if state else "")
+            self.recording_status.setText("录制：等待读取冻结请求")
             with QSignalBlocker(self.objects_table):
                 self.objects_table.setRowCount(0)
             self.object_details.setPlainText("等待当前 Run 的只读对象；不沿用上一 Run 的位姿。")
@@ -189,6 +193,9 @@ class RunView(QWidget):
         self.run_status.setText(f"Run {state.run_id} · {record['mode']} · {record['state']}")
         self.connection_status.setText("已连接 Server" if state.connected else "连接断开；以下为最后已知状态，Run 不因此失败")
         self.message.setText(str(state.error or record.get("failure") or ""))
+        recording = record.get("recording")
+        self.recording_status.setText("诊断轨迹（独立于实时viewer）：\n" + json.dumps(recording, ensure_ascii=False)
+                                     if recording is not None else "录制未启用")
         result = state.interaction["result"]
         self.command_status.setText(f"命令：{state.command_status}；paused={state.paused}；"
                                    f"{json.dumps(result, ensure_ascii=False) if result else '等待实际 command_result'}")

@@ -187,6 +187,10 @@ class ResearchConfigView(QWidget):
         self.forms.layout().addWidget(StrongBodyLabel("运行参数 · RunOptions（预算不乘 world 数）", self))
         self.run_editor = self._editor(("run_options",), run, document["run_options"], {}, {})
         self.run_editor.root_field.label.setText("RunOptions · 只属于下一次运行")
+        recording_path = ("run_options", "recording")
+        if recording_path in self.run_editor.fields:
+            self.run_editor.fields[recording_path].label.setText(
+                "诊断轨迹 · null关闭；world_ids / every_n_decisions / max_data_bytes 显式设置")
         if composition:
             for owner, kind, selections in self._selections(composition):
                 for selection in selections:

@@ -653,6 +653,48 @@ def test_terminal_fetches_published_checkpoint_instead_of_initial_artifact_page(
     assert view.checkpoint_selector.currentData() == "final-cp"
 
 
+def test_recording_events_and_same_seq_publication_snapshot(running):
+    connection, _, controller, view = running
+    recording = dict(status="capturing", config={"world_ids": [0, 1], "every_n_decisions": 3,
+        "max_data_bytes": 1024}, row_bytes=128, rows_per_world=4, static_bytes=200, summary=None,
+        artifact_id=None, error=None)
+    connection.push("/events", {"run_id": "r", "event_seq": 3, "kind": "recording_state", "payload": recording})
+    assert controller.state.record["recording"] == recording
+    assert "128" in view.recording_status.text() and "capturing" in view.recording_status.text()
+    connection.push("/events", {"run_id": "r", "event_seq": 4, "kind": "trajectory", "payload": {"id": "t"}})
+    assert controller.state.record["recording"]["status"] == "capturing"
+    recording.update(status="publishing", summary={"reason": "capacity", "worlds": {"0": {"sample_count": 4}}})
+    connection.push("/events", {"run_id": "r", "event_seq": 5, "kind": "recording_state", "payload": recording})
+    controller.refresh()
+    latest = record() | {"event_seq": 5, "recording": dict(recording, status="published", artifact_id="t")}
+    connection.answer("/runs/r", latest)
+    assert "published" in view.recording_status.text() and "capacity" in view.recording_status.text()
+    assert any(r[2] == "/runs/r/artifacts" for r in connection.requests)
+    connection.answer("/runs/r/artifacts", [{"id": "t", "run": "r", "kind": "trajectory"}])
+    assert controller.state.artifacts[0]["id"] == "t"
+    latest["recording"].update(status="failed", error="disk failed")
+    controller.refresh()
+    connection.answer("/runs/r", latest)
+    assert "disk failed" in view.recording_status.text()
+
+
+def test_publication_read_supersedes_pending_artifact_page(qapp):
+    connection, host = OrderedConnection(), Host()
+    controller = RunController(connection, host)
+    controller.open('r')
+    connection.answer('/runs/r', record())
+    old = next(r for r in connection.requests if r[2] == '/runs/r/artifacts')
+    controller.refresh()
+    connection.answer('/runs/r', record() | {'recording': {'status': 'published', 'artifact_id': 't'}})
+    pages = [r for r in connection.requests if r[2] == '/runs/r/artifacts']
+    assert len(pages) == 2
+    fresh = next(r for r in pages if r[0] != old[0])
+    connection.result_received.emit(1, fresh[0], {'ok': True, 'data': [{'id': 't', 'kind': 'trajectory'}]})
+    connection.result_received.emit(1, old[0], {'ok': True, 'data': []})
+    assert controller.state.artifacts == [{'id': 't', 'kind': 'trajectory'}]
+    controller.close_tab('r')
+
+
 def test_open_other_run_clears_previous_pose_before_async_record_arrives(running):
     connection, _, controller, view = running
     view.objects_table.selectRow(0)

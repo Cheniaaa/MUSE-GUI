@@ -145,6 +145,7 @@ class WorkbenchController(QObject):
             if kind == 'draft':
                 self.results.controller.stop()
                 self.results.refresh_timer.stop()
+                self.results.replay.close_replay()
             elif identity not in self.results.controller.series:
                 self.results.show_runs([identity])
             elif not self.results.controller.active:
@@ -182,6 +183,8 @@ class WorkbenchController(QObject):
     def copy_run(self, context, mode):
         def apply():
             options = {'mode': mode, 'max_decision_steps': context['record']['max_decision_steps']}
+            recording = context['record'].get('recording')
+            options['recording'] = deepcopy(recording['config']) if recording else None
             if context['checkpoint_artifact_id'] is not None:
                 options['checkpoint_artifact_id'] = context['checkpoint_artifact_id']
             self._replace_source(context['source'], options, 'Run 派生实验')
@@ -369,7 +372,7 @@ class WorkbenchController(QObject):
 
     def _retire_results(self):
         for view in self._retired_results[:]:
-            if not view.controller.has_pending_downloads:
+            if not view.controller.has_pending_downloads and not view.releasing:
                 view.deleteLater()
                 self._retired_results.remove(view)
 
@@ -385,7 +388,7 @@ class WorkbenchController(QObject):
         settled = self.resources.close_operations() and settled
         if self.results:
             self.results.close()
-            settled = not self.results.controller.has_pending_downloads and settled
+            settled = not self.results.controller.has_pending_downloads and not self.results.releasing and settled
         self._retire_results()
         settled = not self._retired_results and settled
         settled = self.launcher.close() and settled

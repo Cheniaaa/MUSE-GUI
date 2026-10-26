@@ -242,6 +242,8 @@ class RunController(QObject):
             self.changed.emit()
             return
         data = result["data"]
+        previous_recording = deepcopy(state.record.get("recording")) if state.record else None
+        previous_artifact_tokens = {key for key, value in self._pending.items() if value[1:3] == (self._epoch, 'artifacts')}
         if operation == "run":
             first = state.record is None
             state.apply_snapshot(data)
@@ -309,6 +311,11 @@ class RunController(QObject):
             state.apply_view_event(data, self.view_id)
         elif operation in {"source", "definition", "artifacts"}:
             setattr(state, operation, deepcopy(data))
+        recording = state.record.get("recording") if state.record else None
+        if (recording != previous_recording and recording is not None
+                and recording["status"] == "published"):
+            self._pending = {key: value for key, value in self._pending.items() if key not in previous_artifact_tokens}
+            self._request("artifacts", "GET", self._path("/artifacts"))
         if self._new_run and self._worker_available() and state.display is not None:
             self._new_run = False
             self.set_display("viser", {"enabled": True})

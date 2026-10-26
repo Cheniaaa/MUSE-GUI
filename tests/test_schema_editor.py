@@ -192,3 +192,28 @@ def test_explicit_null_clears_its_hidden_child_pending_atomically(qapp):
     assert draft.document["request"]["task_config"]["group"] is None
     assert not draft.document["pending_inputs"]
     editor.close()
+
+
+def test_recording_schema_three_fields_preserve_null_and_explicit_values(qapp):
+    draft = ExperimentDraft()
+    draft.set_value(('run_options', 'recording'), {'world_ids': [0, 1], 'every_n_decisions': 3, 'max_data_bytes': 4096})
+    schema = {'type': 'object', '$defs': {'RecordingConfig': {'type': 'object', 'properties': {
+        'world_ids': {'type': 'array', 'items': {'type': 'integer', 'minimum': 0}, 'minItems': 1},
+        'every_n_decisions': {'type': 'integer', 'exclusiveMinimum': 0},
+        'max_data_bytes': {'type': 'integer', 'exclusiveMinimum': 0}},
+        'required': ['world_ids', 'every_n_decisions', 'max_data_bytes']}},
+        'properties': {'recording': {'anyOf': [{'$ref': '#/$defs/RecordingConfig'}, {'type': 'null'}], 'default': None}}}
+    editor = SchemaEditor()
+    editor.input_committed.connect(lambda path, value, origin, subtree: draft.commit_input(
+        path, value, pending_path=path_text(origin), pending_subtree=subtree))
+    editor.pending_changed.connect(draft.stage_input)
+    editor.set_section(dict(path=['run_options'], schema=schema, effective={}, origins={}, missing=[], errors=[]),
+                       draft.document['run_options'], {})
+    enter(editor.fields[('run_options', 'recording', 'world_ids', 1)], '2')
+    enter(editor.fields[('run_options', 'recording', 'every_n_decisions')], '5')
+    enter(editor.fields[('run_options', 'recording', 'max_data_bytes')], '8192')
+    assert draft.document['run_options']['recording'] == {'world_ids': [0, 2], 'every_n_decisions': 5, 'max_data_bytes': 8192}
+    field = editor.fields[('run_options', 'recording')]
+    field.mode.setCurrentIndex(field.mode.findData('null'))
+    assert draft.document['run_options']['recording'] is None
+    editor.close()

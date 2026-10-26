@@ -61,6 +61,31 @@ def test_copy_source_keeps_explicit_input_and_independent_run_options(integrated
     assert draft.document['request']['task_config']['nullable'] is None
 
 
+def test_copy_run_keeps_frozen_recording_config(integrated):
+    window, draft, _, controller = integrated
+    window._ask_unsaved = lambda: 'discard'
+    recording = {'world_ids': [1], 'every_n_decisions': 3, 'max_data_bytes': 1024}
+    context = {'record': {'max_decision_steps': 10, 'recording': {'config': recording}},
+               'source': {'root_seed': 7}, 'checkpoint_artifact_id': None}
+    controller.copy_run(context, 'EVALUATE')
+    assert draft.document['run_options']['recording'] == recording
+    recording['world_ids'].append(2)
+    assert draft.document['run_options']['recording']['world_ids'] == [1]
+
+
+def test_retired_results_and_close_wait_for_replay_release(integrated, monkeypatch):
+    from types import SimpleNamespace
+    _, _, _, controller = integrated
+    retired = SimpleNamespace(controller=SimpleNamespace(has_pending_downloads=False), releasing=True,
+                              deleteLater=lambda: None)
+    controller._retired_results.append(retired)
+    controller._retire_results()
+    assert controller._retired_results == [retired]
+    assert not controller.prepare_close()
+    retired.releasing = False
+    assert controller.prepare_close()
+
+
 def test_successful_responses_do_not_restart_catalog_and_history_queries(integrated, monkeypatch):
     _, _, connection, controller = integrated
     requests = []

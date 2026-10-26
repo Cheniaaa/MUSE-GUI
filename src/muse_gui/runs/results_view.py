@@ -11,6 +11,7 @@ from qfluentwidgets import BodyLabel, ComboBox, LineEdit, PushButton
 
 from .metric_series import AXIS_LABELS, MAX_LOG_CHARACTERS, MetricSelection
 from .results_controller import ResultsController
+from .replay_view import ReplayView
 
 
 class ResultsView(QWidget):
@@ -106,13 +107,20 @@ class ResultsView(QWidget):
         artifact_row = QHBoxLayout()
         refresh = PushButton("刷新已发布 artifact", self)
         refresh.clicked.connect(self.controller.refresh_artifacts)
-        download = PushButton("下载完整原始 artifact", self)
-        download.clicked.connect(self._download_selected)
+        self.download_button = PushButton("下载完整原始 artifact", self)
+        self.download_button.clicked.connect(self._download_selected)
+        self.replay_button = PushButton("历史回放", self)
+        self.replay_button.clicked.connect(self._open_replay)
         artifact_row.addWidget(refresh)
-        artifact_row.addWidget(download)
+        artifact_row.addWidget(self.download_button)
+        artifact_row.addWidget(self.replay_button)
         artifact_layout.addLayout(artifact_row)
         self.artifact_selector.currentIndexChanged.connect(self._artifact_selected)
         self.tabs.addTab(artifact_tab, "原始 artifact / checkpoint")
+        self.replay = ReplayView(connection, self)
+        self.tabs.addTab(self.replay, "历史三维回放")
+        self.replay.controller.artifact_published.connect(lambda _: self.controller.refresh_artifacts())
+        connection.state_changed.connect(self._artifact_selected)
         self.message = BodyLabel(self)
         self.message.setWordWrap(True)
         layout.addWidget(self.message)
@@ -127,6 +135,7 @@ class ResultsView(QWidget):
     def show_runs(self, run_ids: list[str]) -> None:
         if len(run_ids) > 2 or len(set(run_ids)) != len(run_ids):
             raise ValueError("最多选择两个不同 Run")
+        self.replay.close_replay()
         self._run_ids = list(run_ids)
         self._selectors.clear()
         selector_layout = self.selector_host.layout()
@@ -300,10 +309,41 @@ class ResultsView(QWidget):
 
     def _artifact_selected(self, *args):
         index = self.artifact_selector.currentIndex()
+        artifact = self._artifact_entries[index] if 0 <= index < len(self._artifact_entries) else None
+        allowed = False
+        source_error = ''
+        if artifact is not None:
+            try:
+                self.controller.artifact_source(artifact)
+                allowed = True
+            except ValueError as error:
+                source_error = '\n' + str(error)
+        self.download_button.setEnabled(allowed)
+        self.replay_button.setEnabled(allowed and artifact['kind'] == 'trajectory')
         if 0 <= index < len(self._artifact_entries):
-            self.artifact_detail.setPlainText(json.dumps(self._artifact_entries[index], ensure_ascii=False, indent=2))
+            self.artifact_detail.setPlainText(json.dumps(self._artifact_entries[index], ensure_ascii=False, indent=2) + source_error)
         else:
             self.artifact_detail.setPlainText("暂无已发布 artifact；运行终态后刷新。不从可见缓存导出完整数据。")
+
+    @property
+    def releasing(self):
+        return self.replay.releasing
+
+    def _open_replay(self):
+        index = self.artifact_selector.currentIndex()
+        if not 0 <= index < len(self._artifact_entries):
+            return
+        artifact = self._artifact_entries[index]
+        if artifact['kind'] != 'trajectory':
+            return
+        try:
+            source = self.controller.artifact_source(artifact)
+        except ValueError as error:
+            self.message.setText(str(error))
+            return
+        self.replay.open(dict(catalog_id=source['catalog_id'], run_id=source['run_id'],
+                              trajectory_artifact_id=source['artifact_id'], generation=source['generation']))
+        self.tabs.setCurrentWidget(self.replay)
 
     def _download_selected(self):
         index = self.artifact_selector.currentIndex()
@@ -312,7 +352,11 @@ class ResultsView(QWidget):
         artifact = self._artifact_entries[index]
         destination, _ = QFileDialog.getSaveFileName(self, "下载完整原始 artifact", Path(artifact["path"]).name)
         if destination:
-            self.controller.download_artifact(artifact, Path(destination))
+            try:
+                self.controller.download_artifact(artifact, Path(destination))
+            except ValueError as error:
+                self.message.setText(str(error))
+                return
             self.message.setText("下载中；完成后校验完整文件 SHA-256 和大小，写入 .source.json 来源记录。")
 
     def _download_finished(self, result):
@@ -320,6 +364,7 @@ class ResultsView(QWidget):
                              + json.dumps(result, ensure_ascii=False))
 
     def closeEvent(self, event):
+        self.replay.close_replay()
         self.refresh_timer.stop()
         self.controller.stop()
         super().closeEvent(event)
