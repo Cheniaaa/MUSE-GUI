@@ -16,6 +16,7 @@ class ReplayView(QWidget):
         super().__init__(parent)
         self.viewer = ViewerHost(self)
         self.controller = ReplayController(connection, self.viewer, self)
+        self.controller.set_visible(self.isVisible())
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.source_status = BodyLabel('选择已发布trajectory打开独立历史回放；Server须在线。', self)
@@ -238,6 +239,14 @@ class ReplayView(QWidget):
         self.diagnostic_note.setText('无学习数据（对象未绑定role）' if details and details['role'] is None
             else '初态/reset行：动作和评分不适用' if details and details['phase'] != 'step'
             else 'scope=role / role_slot；单个已录decision的动作、reward与命名cost，不是区间累计。')
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.controller.set_visible(self.isVisible())
+
+    def hideEvent(self, event):
+        self.controller.set_visible(False)
+        super().hideEvent(event)
 
     def closeEvent(self, event):
         self.close_replay()

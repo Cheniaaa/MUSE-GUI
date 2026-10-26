@@ -253,6 +253,7 @@ def test_results_open_trajectory_refresh_export_and_wait_for_release(qapp, monke
     monkeypatch.setattr(replay_view, 'ViewerHost', Host)
     connection = OrderedConnection()
     view = ResultsView(connection, source_url='http://server')
+    view.show()
     view.show_runs(['r'])
     artifact = {'id': 'trajectory', 'run': 'r', 'kind': 'trajectory', 'path': 'trajectories/t.zip', 'size': 1, 'sha256': 'x'}
     connection.answer('/runs/r/artifacts', [artifact])

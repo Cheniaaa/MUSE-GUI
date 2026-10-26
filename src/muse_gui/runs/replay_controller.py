@@ -22,6 +22,7 @@ class ReplayController(QObject):
         self._serial = self._epoch = self._command_seq = 0
         self._pending = {}
         self._stream = self._opened_url = None
+        self._visible = True
         self._export_pending = False
         self._export_id = None
         self._published = set()
@@ -97,6 +98,13 @@ class ReplayController(QObject):
         if self.can_cancel_export:
             self._request('cancel_export', 'DELETE', self._path('/recordings/') + quote(self._export_id, safe=''))
             self.changed.emit()
+
+    def set_visible(self, visible: bool) -> None:
+        """只回收/重载本地网页；历史会话、游标和已冻结导出继续。"""
+        if visible == self._visible:
+            return
+        self._visible = visible
+        self._sync_view()
 
     def close(self) -> None:
         if self._current() and self.state.session_id is not None:
@@ -205,13 +213,15 @@ class ReplayController(QObject):
         self.changed.emit()
 
     def _sync_view(self):
+        if not self._visible or not self.ready:
+            if self._opened_url is not None:
+                self.viewer.unload()
+                self._opened_url = None
+            return
         data = self.state.data
-        if data['status'] == 'ready' and data['viewer_url'] and data['viewer_url'] != self._opened_url:
+        if data['viewer_url'] and data['viewer_url'] != self._opened_url:
             self._opened_url = data['viewer_url']
             self.viewer.open(self._opened_url, self.state.session_id)
-        elif data['status'] in ('error', 'closing') and self._opened_url is not None:
-            self.viewer.unload()
-            self._opened_url = None
 
     def _connection_changed(self, connection):
         if self.state is not None and (connection['state'] != 'connected'
